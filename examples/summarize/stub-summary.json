@@ -1,0 +1,22 @@
+{
+ "summary": "Pour-over brewing runs hot water through ground coffee by gravity. Temperature, ratio and grind size control the taste, and a cup takes three to four minutes.",
+ "key_points": [
+  "Water is usually 90-96 °C.",
+  "Start at 1 g coffee to 16 g water.",
+  "Sour: grind finer or use hotter water; bitter: grind coarser or brew shorter."
+ ],
+ "evidence": [
+  {
+   "point": 0,
+   "quote": "The water temperature is usually between 90 and 96 degrees Celsius."
+  },
+  {
+   "point": 1,
+   "quote": "A common starting ratio is 1 gram of coffee to 16 grams of water."
+  },
+  {
+   "point": 2,
+   "quote": "If the brew tastes sour, the usual fix is a finer grind or hotter water."
+  }
+ ]
+}

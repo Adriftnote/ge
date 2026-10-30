@@ -1,0 +1,89 @@
+{
+ "name": "summarize",
+ "doc": "Document summary -> separate verify -> script render. Offline: --executor stub uses stub_output fixtures.",
+ "contract": {
+  "version": 1,
+  "inputs": [
+   {
+    "id": "source",
+    "path": "summarize/source.md",
+    "mode": "inline",
+    "verified_by": "example text written for this repo",
+    "sha256": "8fc329575f5d18abff06ec7abbac441f5addedbe341ecdea09cdf0852b4ed48b"
+   }
+  ]
+ },
+ "nodes": [
+  {
+   "id": "summarize",
+   "kind": "model",
+   "prompt": "summarize/summarize.md",
+   "inputs": [],
+   "retry": 1,
+   "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "summary",
+     "key_points",
+     "evidence"
+    ],
+    "properties": {
+     "summary": {
+      "type": "string",
+      "minLength": 20
+     },
+     "key_points": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+       "type": "string",
+       "minLength": 3
+      }
+     },
+     "evidence": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "point",
+        "quote"
+       ],
+       "properties": {
+        "point": {
+         "type": "integer"
+        },
+        "quote": {
+         "type": "string",
+         "minLength": 5
+        }
+       }
+      }
+     }
+    }
+   },
+   "stub_output": "summarize/stub-summary.json"
+  },
+  {
+   "id": "verify",
+   "kind": "verify",
+   "prompt": "summarize/verify.md",
+   "rubric": "summarize/rubric.md",
+   "inputs": [
+    "summarize"
+   ],
+   "stub_output": "summarize/stub-verify.json"
+  },
+  {
+   "id": "render",
+   "kind": "script",
+   "script": "summarize/render.py",
+   "inputs": [
+    "summarize",
+    "verify"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,144 @@
+{
+ "name": "fix-and-test",
+ "doc": "Code fix -> runtime probe (tests on a temp copy) -> separate verify -> acceptance gate -> non-destructive apply.",
+ "contract": {
+  "version": 1,
+  "inputs": [
+   {
+    "id": "target",
+    "path": "fix-and-test/src/stats.py",
+    "mode": "inline",
+    "verified_by": "python -m unittest test_stats (fails on median_even)",
+    "sha256": "fd538725c10b13cb0ff2b5b075885bd134b8972069b7f6bceed2909b80d565d7"
+   }
+  ],
+  "scope": {
+   "files": [
+    "stats.py"
+   ]
+  },
+  "runtime_checks": [
+   "tests_pass"
+  ],
+  "requires": {
+   "tests_pass": [
+    "tests_pass"
+   ]
+  },
+  "mechanical": [
+   "tests_pass"
+  ],
+  "probe": {
+   "script": "fix-and-test/probe.py",
+   "timeout": 60
+  }
+ },
+ "nodes": [
+  {
+   "id": "patch",
+   "kind": "model",
+   "cwd": "fix-and-test/src",
+   "prompt": "fix-and-test/patch.md",
+   "inputs": [],
+   "retry": 2,
+   "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "summary",
+     "patches",
+     "risks",
+     "evidence"
+    ],
+    "properties": {
+     "summary": {
+      "type": "string",
+      "minLength": 20
+     },
+     "patches": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "file",
+        "old_str",
+        "new_str",
+        "why"
+       ],
+       "properties": {
+        "file": {
+         "type": "string"
+        },
+        "old_str": {
+         "type": "string",
+         "minLength": 10
+        },
+        "new_str": {
+         "type": "string"
+        },
+        "why": {
+         "type": "string",
+         "minLength": 10
+        }
+       }
+      }
+     },
+     "risks": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "evidence": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "claim",
+        "file",
+        "line_hint"
+       ],
+       "properties": {
+        "claim": {
+         "type": "string"
+        },
+        "file": {
+         "type": "string"
+        },
+        "line_hint": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   "stub_output": "fix-and-test/stub-patch.json"
+  },
+  {
+   "id": "verify",
+   "kind": "verify",
+   "cwd": "fix-and-test/src",
+   "prompt": "fix-and-test/verify.md",
+   "rubric": "fix-and-test/rubric.md",
+   "inputs": [
+    "patch"
+   ],
+   "stub_output": "fix-and-test/stub-verify.json"
+  },
+  {
+   "id": "apply",
+   "kind": "script",
+   "script": "fix-and-test/apply.py",
+   "inputs": [
+    "patch",
+    "verify"
+   ],
+   "apply": true
+  }
+ ]
+}

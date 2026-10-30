@@ -1,0 +1,27 @@
+{
+ "doc": "읽기만 하고 사실을 모은다 — 패치 없음. 조사 워커 여럿 + 집계 script.",
+ "nodes": [
+  {
+   "id": "cases",
+   "kind": "model",
+   "role": "사례 수집 (fanout 가능)"
+  },
+  {
+   "id": "verify",
+   "kind": "verify",
+   "role": "근거 대조",
+   "inputs": [
+    "cases"
+   ]
+  },
+  {
+   "id": "tally",
+   "kind": "script",
+   "role": "집계",
+   "inputs": [
+    "cases",
+    "verify"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,28 @@
+{
+ "doc": "파일 하나를 고친다 — 가장 흔한 뼈대. 워커 1 + 다른 계보 검사자 + script 적용.",
+ "nodes": [
+  {
+   "id": "{patch_node}",
+   "kind": "model",
+   "role": "만드는 노드"
+  },
+  {
+   "id": "verify",
+   "kind": "verify",
+   "role": "다른 계보 검사자",
+   "inputs": [
+    "{patch_node}"
+   ]
+  },
+  {
+   "id": "apply",
+   "kind": "script",
+   "role": "검증된 패치 적용",
+   "inputs": [
+    "{patch_node}",
+    "verify"
+   ],
+   "apply": true
+  }
+ ]
+}

@@ -1,0 +1,24 @@
+{
+ "verdicts": [
+  {
+   "item_id": "faithful",
+   "verdict": "pass",
+   "reason": "all three points map to source lines 3, 4 and 7-8"
+  },
+  {
+   "item_id": "evidence_exact",
+   "verdict": "pass",
+   "reason": "each quote found verbatim in source.md"
+  },
+  {
+   "item_id": "coverage",
+   "verdict": "pass",
+   "reason": "temperature, ratio and both fixes are present"
+  },
+  {
+   "item_id": "length",
+   "verdict": "pass",
+   "reason": "summary has 2 sentences"
+  }
+ ]
+}

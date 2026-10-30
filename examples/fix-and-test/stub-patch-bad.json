@@ -1,0 +1,26 @@
+{
+ "summary": "median: return the lower middle value for even-length input (wrong on purpose).",
+ "patches": [
+  {
+   "file": "stats.py",
+   "old_str": "    n = len(s)\n    return s[n // 2]\n",
+   "new_str": "    n = len(s)\n    if n % 2 == 0:\n        return s[n // 2 - 1]\n    return s[n // 2]\n",
+   "why": "deliberately wrong patch for the blocked-run example"
+  }
+ ],
+ "risks": [
+  "후속: median([]) still raises IndexError (not asked)."
+ ],
+ "evidence": [
+  {
+   "claim": "median indexes the middle element only",
+   "file": "stats.py",
+   "line_hint": "return s[n // 2]"
+  },
+  {
+   "claim": "test expects 2.5 for [4, 1, 3, 2]",
+   "file": "test_stats.py",
+   "line_hint": "median([4, 1, 3, 2]), 2.5"
+  }
+ ]
+}

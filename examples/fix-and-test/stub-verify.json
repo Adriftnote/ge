@@ -1,0 +1,19 @@
+{
+ "verdicts": [
+  {
+   "item_id": "anchor_unique",
+   "verdict": "pass",
+   "reason": "old_str occurs once in stats.py"
+  },
+  {
+   "item_id": "file_scope",
+   "verdict": "pass",
+   "reason": "only stats.py is patched"
+  },
+  {
+   "item_id": "does_what_asked",
+   "verdict": "pass",
+   "reason": "even branch averages s[n//2-1] and s[n//2]; odd path unchanged"
+  }
+ ]
+}

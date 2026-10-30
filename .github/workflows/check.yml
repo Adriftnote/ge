@@ -1,0 +1,41 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Alloy 6.2.0 jar (cached)
+        id: alloy-cache
+        uses: actions/cache@v4
+        with:
+          path: alloy.jar
+          key: alloy-6.2.0
+      - name: Download Alloy 6.2.0
+        if: steps.alloy-cache.outputs.cache-hit != 'true'
+        run: curl -fsSL -o alloy.jar https://github.com/AlloyTools/org.alloytools.alloy/releases/download/v6.2.0/org.alloytools.alloy.dist.jar
+      - name: Set ALLOY_JAR
+        run: echo "ALLOY_JAR=$GITHUB_WORKSPACE/alloy.jar" >> "$GITHUB_ENV"
+      - name: Unit tests (standard library only)
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+      - name: Examples run end to end with the stub executor
+        run: |
+          ./ge run examples/summarize.json --executor stub
+          ./ge run examples/fix-and-test.json --executor stub
+          if ./ge run examples/fix-and-test-bad.json --executor stub; then echo "bad patch was not blocked"; exit 1; fi
+      - name: Structural invariants (Alloy)
+        run: ./ge check-model

@@ -1,0 +1,1928 @@
+#!/usr/bin/env python3
+"""ge — work-graph coordinator. Walks a node spec, calls one worker per node, keeps a ledger.
+
+    ge plan   <spec.json>                 topological order and node kinds
+    ge run    <spec.json> [--executor claude|codex|cursor|grok|stub] [--run-id X] [--model M]
+                          [--input k=v ...] [--max-cost USD] [--no-baseline] [--resume RUN --from guard|verify]
+    ge note   <run-dir> "<text>"          record one human intervention
+    ge report <run-dir> [--out FILE]      ledger -> run metrics (no artifact bodies)
+    ge ledger [--spec S] [--role R] [--since ISO] [--json]   pass rate / rework / tokens per role (spec/node)
+    ge lesson <spec.json> <node> "<text>" append a one-line lesson for a producing node
+    ge new    <name> --cwd DIR --target FILE [--workflow patch|research]   scaffold a spec
+    ge workflows                          list scaffold layouts
+    ge fabric [query] [--show N|--check|--sync]   look for a prompt skeleton (Fabric patterns, MIT)
+    ge contract-sha <spec.json> [--write] compute contract.inputs sha256
+    ge approve <run-dir> <item>           approve an out-of-scope item blocked by the acceptance gate
+    ge trace  <run-dir> [--node N] [--attempt K]   dump a worker's raw output to a file
+    ge progress [--limit N] [--json]      node-by-node status of recent runs
+    ge stats --topologies [dirs...]       common node/edge shapes; which match a recipe, which to promote
+    ge check-model                        check structural invariants (formal/*.als) with Alloy
+
+Principles:
+  - The coordinator is code. Slotting, dedup checks and totals happen here. A worker sees one node.
+  - Worker output is forced to a JSON schema. Schema failure = rework (retry with the errors attached).
+  - The verify node is a separate call (ideally a different model). Only verify reads the rubric.
+  - The runner does not judge. It records facts in the ledger. Acceptance is the verify node's verdict.
+  - Artifact bodies never go into metrics. Paths, hashes and counts only.
+
+Spec (JSON):
+  {"name": "...", "nodes": [
+     {"id": "draft", "kind": "model", "prompt": "x/draft.md", "inputs": [], "schema": {...},
+      "fanout": "<node with items[]>"?, "retry": 2},
+     {"id": "verify", "kind": "verify", "prompt": "x/verify.md", "rubric": "x/rubric.md", "inputs": ["draft"]},
+     {"id": "apply", "kind": "script", "script": "x/apply.py", "args": [], "inputs": ["verify"]}
+  ]}
+  In a prompt file, {{input.<id>}} is that node's artifact (JSON), {{rubric}} the rubric text,
+  {{item}} / {{item.<key>}} the fanout item, {{<k>}} a --input value.
+  Relative paths resolve against the spec's directory (or the parent of a `graphs/` directory).
+  Node keys: "model", "executor", "cwd", "timeout", "retry", "tools": "read" (grok), "lessons",
+  "when": {"node": "route", "key": "branch", "equals"|"in": ...}, "stub_output": "<fixture.json>".
+  Optional top-level "contract" adds deterministic hooks (see ge_lib/guard.py).
+
+Ledger: ./.ge/runs/<run-id>/ (or $GE_RUNS_DIR). Worker CLIs are optional and found on PATH or via
+GE_CLAUDE / GE_CODEX / GE_CURSOR / GE_GROK. The stub executor needs nothing.
+"""
+import argparse, collections, datetime, glob, hashlib, json, os, re, shutil, socket, subprocess, sys, tempfile, time
+from concurrent.futures import ThreadPoolExecutor
+
+GE_HOME = os.path.dirname(os.path.realpath(__file__))
+if GE_HOME not in sys.path:
+    sys.path.insert(0, GE_HOME)
+from ge_lib import guard, fabric  # noqa: E402  guard: deterministic hooks / fabric: prompt-skeleton lookup
+
+
+def resolve_ge_dir(base=None):
+    """Ledger location (.ge): GE_RUNS_DIR (its parent if it ends in /runs) > main checkout of a git
+    worktree (so the ledger survives worktree cleanup) > base (current directory)."""
+    base = base or os.getcwd()
+    env = os.environ.get("GE_RUNS_DIR")
+    if env:
+        env = os.path.abspath(env)
+        return os.path.dirname(env) if os.path.basename(env) == "runs" else env
+    try:
+        p = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=base,
+                           capture_output=True, text=True, timeout=10)
+        c = p.stdout.strip()
+        if p.returncode == 0 and c and os.path.basename(os.path.normpath(c)) == ".git":
+            return os.path.join(os.path.dirname(os.path.normpath(c)), ".ge")
+    except Exception:
+        pass
+    return os.path.join(base, ".ge")
+
+
+GE_DIR = resolve_ge_dir()
+# Project root of the spec being run. Relative paths in a spec (prompt, rubric, script, lessons, cwd,
+# contract paths) resolve here. A spec at <root>/graphs/<name>.json has root <root>; otherwise its own folder.
+PROJ = os.getcwd()
+
+
+def set_project_from_spec(spec_path):
+    global PROJ
+    d = os.path.dirname(os.path.abspath(spec_path))
+    PROJ = os.path.dirname(d) if os.path.basename(d) in ("graphs", os.environ.get("GE_GRAPHS_DIR", "graphs")) else d
+    return PROJ
+
+
+def proj_path(p):
+    """Spec-relative path -> absolute path."""
+    if not p or os.path.isabs(p):
+        return p
+    return os.path.join(PROJ, p)
+
+
+VERDICTS_SCHEMA = {
+    "type": "object", "additionalProperties": False, "required": ["verdicts"],
+    "properties": {"verdicts": {"type": "array", "minItems": 1, "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["item_id", "verdict", "reason"],
+        "properties": {"item_id": {"type": "string"},
+                       "verdict": {"type": "string", "enum": ["pass", "fail", "unverifiable"]},
+                       "reason": {"type": "string", "minLength": 3}}}}}}
+WORKER_DISALLOWED = "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task"   # claude workers are read-only
+# grok headless tool names (as listed by the CLI's available_commands). Action, write and external tools:
+GROK_BLOCK_ACT = ("run_terminal_command,search_replace,write,kill_command_or_subagent,get_command_or_subagent_output,todo_write,"
+                  "spawn_subagent,scheduler_create,scheduler_delete,scheduler_list,monitor,search_tool,use_tool,workflow,"
+                  "enter_plan_mode,exit_plan_mode,ask_user_question,send_feedback,web_search,web_fetch,image_gen,image_edit,"
+                  "image_to_video,reference_to_video")
+# MCP/plugin tools cannot be removed with --disallowed-tools; disable MCP scanning in the worker env instead.
+GROK_BLOCK_READ = "read_file,list_dir,grep"
+GROK_DISALLOWED_READ_OK = GROK_BLOCK_ACT                                # node allows tools:"read": keep read tools
+GROK_DISALLOWED = GROK_DISALLOWED_READ_OK + "," + GROK_BLOCK_READ     # default: no tools at all
+GROK_OVERRIDE = "You are a GE worker. Return JSON matching the given schema. Do not use tools. Do not write files. No prose."
+# For nodes that must read files. "Do not use tools" made research nodes answer with placeholders.
+GROK_OVERRIDE_READ = ("You are a GE worker. First READ the files you need with your read-only tools "
+                      "(list, read, grep). Do not answer before reading. Then return JSON matching the given schema. "
+                      "Never write or modify anything. No prose. Placeholder values are a failure.")
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def sha256_text(s):
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _rt(path, encoding="utf-8", errors=None, newline=None):
+    """Read a text file and close it."""
+    with open(path, encoding=encoding, errors=errors, newline=newline) as f:
+        return f.read()
+
+
+def _rb(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def ge_sha():
+    """Commit of this ge checkout (recorded in run_started so runs can be compared across versions)."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=GE_HOME, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{7,40}", out) else None
+
+
+def claude_bin():
+    """claude executable. GE_CLAUDE > PATH (on Windows which() also finds claude.cmd/.exe) > None."""
+    return os.environ.get("GE_CLAUDE") or shutil.which("claude")
+
+
+def grok_bin():
+    """grok 실행 파일. GE_GROK > PATH > None. .py 는 테스트용 fake."""
+    return os.environ.get("GE_GROK") or shutil.which("grok")
+
+
+def grok_cmd():
+    exe = grok_bin()
+    if not exe:
+        return None
+    if exe.lower().endswith(".py"):
+        return [sys.executable, exe]
+    return [exe]
+
+
+def cursor_cmd():
+    """Cursor Agent CLI. GE_CURSOR (.py = test fake, .js = run with node) > %LOCALAPPDATA%/cursor-agent/versions/<latest>/index.js
+    (Windows: calling index.js directly avoids the .cmd wrapper's quoting) > cursor-agent on PATH."""
+    exe = os.environ.get("GE_CURSOR")
+    if exe:
+        if exe.lower().endswith(".py"):
+            return [sys.executable, exe]
+        if exe.lower().endswith(".js"):
+            node = os.path.join(os.path.dirname(exe), "node.exe")
+            return [node if os.path.exists(node) else "node", exe]
+        return [exe]
+    root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "cursor-agent", "versions")
+    if os.path.isdir(root):
+        vers = sorted(d for d in os.listdir(root) if os.path.isfile(os.path.join(root, d, "index.js")))
+        if vers:
+            d = os.path.join(root, vers[-1])
+            node = os.path.join(d, "node.exe")
+            return [node if os.path.exists(node) else "node", os.path.join(d, "index.js")]
+    exe = shutil.which("cursor-agent")
+    return [exe] if exe else None
+
+
+def _node_for_script(script):
+    """Return a node executable for a JS CLI script, preferring the npm-adjacent node.exe on Windows."""
+    local = os.path.join(os.path.dirname(script), "node.exe")
+    return local if os.path.exists(local) else (shutil.which("node") or "node")
+
+
+def _npm_codex_js_from_cmd(cmd_path):
+    """Resolve npm codex.cmd next to node_modules/@openai/codex/bin/codex.js.
+    Avoids cmd.exe argument quoting issues. For arbitrary GE_CODEX .cmd files, keep the override literal."""
+    base = os.path.dirname(cmd_path)
+    js = os.path.join(base, "node_modules", "@openai", "codex", "bin", "codex.js")
+    return js if os.path.isfile(js) else None
+
+
+def codex_cmd():
+    """Codex CLI.
+    GE_CODEX(.py fake, .js, or explicit executable) overrides discovery. PATH npm codex.cmd is resolved
+    to node + node_modules/@openai/codex/bin/codex.js when possible to avoid cmd.exe quoting.
+    Arbitrary .cmd overrides are honored as explicit user input but may depend on Windows wrapper quoting."""
+    override = os.environ.get("GE_CODEX")
+    exe = override or shutil.which("codex")
+    if not exe:
+        return None
+    low = exe.lower()
+    if low.endswith(".py"):
+        return [sys.executable, exe]
+    if low.endswith(".js"):
+        return [_node_for_script(exe), exe]
+    if low.endswith((".cmd", ".bat")) and not override:
+        js = _npm_codex_js_from_cmd(exe)
+        if js:
+            return [_node_for_script(js), js]
+    return [exe]
+
+
+from ge_lib.schema import validate, schema_problems  # noqa: E402  minimal JSON Schema subset
+
+
+def resolved_executor(node, run_executor):
+    return node.get("executor") or run_executor
+
+
+def grok_generate_requires_read(node, run_executor):
+    """A grok producing node (patches/new_files) needs tools=read.
+
+    Without it GROK_OVERRIDE says 'Do not use tools', so the worker never opens the file and returns
+    placeholder patches. Cursor runs in --mode ask and does not need this."""
+    if resolved_executor(node, run_executor) != "grok":
+        return None
+    if node.get("kind") == "verify":
+        return None
+    props = ((node.get("schema") or {}).get("properties") or {})
+    if "patches" not in props and "new_files" not in props:
+        return None
+    if node.get("tools") == "read":
+        return None
+    return (f"{node.get('id')}: grok 생성 노드는 tools=read 가 필요하다 "
+            "(없으면 Do not use tools → placeholder). Cursor 워커는 이 칸이 필요 없다.")
+
+
+def patch_old_str_anchors(payload, cwd):
+    """패치 old_str 이 대상 파일에 정확히 1번 있어야 한다. 스키마 길이만 보면 placeholder 가 통과한다."""
+    if not isinstance(payload, dict):
+        return []
+    patches = payload.get("patches")
+    if not isinstance(patches, list):
+        return []
+    errs = []
+    for i, p in enumerate(patches):
+        if not isinstance(p, dict):
+            continue
+        rel, old = p.get("file"), p.get("old_str")
+        if not rel or not isinstance(old, str):
+            continue
+        path = rel if os.path.isabs(rel) else os.path.join(cwd or PROJ, rel)
+        if not os.path.isfile(path):
+            errs.append(f"patches[{i}]: 파일 없음 {rel}")
+            continue
+        n = _rt(path, encoding="utf-8", errors="replace").count(old)
+        if n != 1:
+            errs.append(f"patches[{i}]: old_str {n}회(1이어야 함) {rel}")
+    return errs
+
+
+# ---------------- 실행자 ----------------
+
+
+# ---------------- executors ----------------
+def exec_claude(prompt, schema, timeout, model=None, cwd=None, tag=None, tools=None):
+    """claude -p 헤드리스. 도구 제한 + 스키마 강제. 반환 (payload|None, meta)."""
+    exe = claude_bin()
+    if not exe:
+        return None, {"executor": "claude", "error": "claude 실행 파일을 찾지 못함: GE_CLAUDE 를 설정", "duration_s": 0.0}
+    cmd = [exe, "--print", "--output-format", "json", "--json-schema", json.dumps(schema),
+           "--disallowedTools", WORKER_DISALLOWED, "--permission-mode", "dontAsk",
+           "--no-session-persistence"]
+    if exe.lower().endswith(".py"):           # wrapper script / test fake, same rule as grok_cmd
+        cmd = [sys.executable] + cmd
+    if model:
+        cmd += ["--model", model]
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+                           cwd=cwd or PROJ, env=env)
+    except subprocess.TimeoutExpired:
+        return None, {"executor": "claude", "error": "timeout", "duration_s": round(time.time() - t0, 1)}
+    except OSError as e:
+        return None, {"executor": "claude", "error": f"claude 실행 실패 ({exe}): {e}"[-400:], "duration_s": round(time.time() - t0, 1)}
+    meta = {"executor": "claude", "duration_s": round(time.time() - t0, 1), "exit": r.returncode}
+    if r.returncode != 0:
+        meta["error"] = (r.stderr or r.stdout)[-400:]
+        return None, meta
+    try:
+        raw = json.loads(r.stdout)
+    except Exception:
+        meta["error"] = "stdout 이 JSON 이 아님"
+        return None, meta
+    usage = raw.get("usage") or {}
+    meta.update({"model": raw.get("model") or next(iter(raw.get("modelUsage") or {}), None),
+                 "input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens"),
+                 "cache_read": usage.get("cache_read_input_tokens"), "cache_write": usage.get("cache_creation_input_tokens"),
+                 "cost_usd": raw.get("total_cost_usd"), "session_sha": sha256_text(str(raw.get("session_id", "")))[:12]})
+    payload = raw.get("structured_output", raw.get("result"))
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            meta["error"] = "result 가 JSON 이 아님"
+            return None, meta
+    return payload, meta
+
+
+def exec_stub(prompt, schema, timeout, model=None, cwd=None, tag=None, tools=None):
+    """모델 없이 스키마에 맞는 최소 산출물을 만든다. 배선·원장·집계 시험용."""
+    def fill(s):
+        t = s.get("type")
+        if t == "object":
+            return {k: fill(v) for k, v in s.get("properties", {}).items() if k in s.get("required", s.get("properties", {}))}
+        if t == "array":
+            return [fill(s.get("items", {})) for _ in range(max(1, s.get("minItems", 1)))]
+        if t == "string":
+            if "enum" in s:
+                return s["enum"][0]
+            return ("stub-" * 40)[:max(s.get("minLength", 4), 4)]
+        if t in ("number", "integer"):
+            return 0
+        if t == "boolean":
+            return True
+        return None
+    # STUB_FAIL_ONCE=<node> 로 재작업 경로를 시험한다
+    if os.environ.get("STUB_FAIL_ONCE") and os.environ["STUB_FAIL_ONCE"] in prompt and not os.environ.get("_STUB_FAILED"):
+        os.environ["_STUB_FAILED"] = "1"
+        return {"bogus": 1}, {"executor": "stub", "duration_s": 0.0, "model": "stub"}
+    return fill(schema), {"executor": "stub", "duration_s": 0.0, "model": "stub", "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+
+
+def parse_grok_output(raw):
+    """Grok --output-format json 봉투 -> (payload, meta 필드). 본문은 넣지 않는다."""
+    payload = raw.get("structuredOutput", raw.get("structured_output"))
+    if payload is None:
+        text = raw.get("text") or raw.get("result")
+        if isinstance(text, str):
+            try:
+                payload = json.loads(text)
+            except Exception:
+                payload = None
+        elif isinstance(text, dict):
+            payload = text
+    mu = raw.get("modelUsage") or raw.get("model_usage") or {}
+    model = next(iter(mu), None) if isinstance(mu, dict) and mu else raw.get("model")
+    usage = raw.get("usage") or {}
+    sid = raw.get("sessionId") or raw.get("session_id") or ""
+    meta = {
+        "model": model,
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cache_read": usage.get("cache_read_input_tokens") or usage.get("cacheReadInputTokens"),
+        "cost_usd": raw.get("total_cost_usd"),
+        "session_sha": sha256_text(str(sid))[:12] if sid else None,
+    }
+    return payload, meta
+
+
+def _finish_grok_stdout(stdout, stderr, meta):
+    if meta.get("exit") not in (0, None) and not (stdout or "").strip():
+        meta["error"] = (stderr or "")[-400:]
+        return None, meta
+    try:
+        raw = json.loads(stdout)
+    except Exception:
+        meta["error"] = "stdout 이 JSON 이 아님"
+        if stderr:
+            meta["stderr"] = stderr[-200:]
+        return None, meta
+    payload, extra = parse_grok_output(raw)
+    meta.update({k: v for k, v in extra.items() if v is not None})
+    if payload is None:
+        meta["error"] = "structuredOutput 없음"
+        return None, meta
+    return payload, meta
+
+
+def _write_grok_call_dir(prompt, schema, call_dir=None):
+    """호출 디렉터리(prompt.txt/schema.json/stdout.json). 워커 cwd 와는 별개다 — 워커를 레포로 보내도 레포에 파일을 남기지 않는다."""
+    here = call_dir or tempfile.mkdtemp(prefix="ge-grok-")
+    os.makedirs(here, exist_ok=True)
+    with open(os.path.join(here, "prompt.txt"), "w", encoding="utf-8") as f:
+        f.write(prompt)
+    with open(os.path.join(here, "schema.json"), "w", encoding="utf-8") as f:
+        json.dump(schema, f, ensure_ascii=False)
+    return here
+
+
+def run_headless(argv, here, timeout, env=None, stdin_file=None):
+    """Run a worker CLI as a quiet subprocess. Returns (exit_code|None, stdout, stderr)."""
+    env_all = {**os.environ, **(env or {})}
+    stdin_text = _rt(stdin_file, encoding="utf-8") if stdin_file else None
+    try:
+        r = subprocess.run(argv, input=stdin_text, capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+                           cwd=env_all.get("GE_CWD") or None, env=env_all)
+    except subprocess.TimeoutExpired:
+        return None, "", "timeout"
+    except OSError as e:
+        return None, "", f"실행 실패: {e}"
+    return r.returncode, r.stdout or "", r.stderr or ""
+
+
+def _json_lines(text):
+    out = []
+    for l in text.splitlines():
+        l = l.strip()
+        if l.startswith("{"):
+            try:
+                out.append(json.loads(l))
+            except Exception:
+                pass
+    return out
+
+
+def _grok_argv(here, model, cwd=None, read=False):
+    cmd = grok_cmd()
+    if not cmd:
+        return None
+    with open(os.path.join(here, "schema.json"), encoding="utf-8") as f:
+        schema_text = f.read()
+    cmd += [
+        "--prompt-file", os.path.join(here, "prompt.txt"),
+        "--json-schema", schema_text,
+        "--cwd", cwd or here,
+        "--system-prompt-override", GROK_OVERRIDE_READ if read else GROK_OVERRIDE,
+        "--disallowed-tools", os.environ.get("GE_GROK_DISALLOWED") or (GROK_DISALLOWED_READ_OK if read else GROK_DISALLOWED),
+        "--permission-mode", "dontAsk",
+        "--max-turns", "24" if read else "4",
+        "--verbatim",
+        "--no-auto-update",
+    ]
+    if os.environ.get("GE_GROK_EXTRA"):       # JSON list of extra flags, e.g. ["--effort","medium"]
+        cmd += json.loads(os.environ["GE_GROK_EXTRA"])
+    if model:
+        cmd += ["--model", model]
+    return cmd
+
+
+def exec_grok(prompt, schema, timeout, model=None, cwd=None, tag=None, tools=None):
+    """grok headless. tools="read" lets the worker read files first; default answers in one shot without tools."""
+    if not grok_cmd():
+        return None, {"executor": "grok", "error": "grok 실행 파일을 찾지 못함: GE_GROK 를 설정", "duration_s": 0.0}
+    here = _write_grok_call_dir(prompt, schema)
+    cmd = _grok_argv(here, model, cwd, read=tools == "read")
+    env = {"GE_WORKER": "1", "GE_CWD": cwd or here}
+    t0 = time.time()
+    code, out, err = run_headless(cmd, here, timeout, env=env)
+    with open(os.path.join(here, "stdout.json"), "w", encoding="utf-8", errors="replace") as f:
+        f.write(out)
+    meta = {"executor": "grok", "duration_s": round(time.time() - t0, 1), "exit": code, "call_dir": here}
+    if code is None:
+        meta["error"] = err or "timeout"
+        return None, meta
+    return _finish_grok_stdout(out, err, meta)
+
+
+def _strip_fences(s):
+    s = s.strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[1] if "\n" in s else ""
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    return s.strip()
+
+
+def _trailing_json(text):
+    """Cursor 는 result 에 서술문과 최종 JSON 을 이어 붙인다 ("...하겠습니다.{...}"). 마지막 최상위 객체를 꺼낸다.
+    앞에서부터 raw_decode 로 후보를 훑는다 — 뒤에서 중괄호를 세는 방식은 **문자열 안의 중괄호**에 걸려 깨졌다
+    (예: 패치 본문의 `{$var}` 같은 중괄호 때문에 완전한 JSON 을 'JSON 이 아님' 으로 버렸다)."""
+    s = _strip_fences(text)
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    dec = json.JSONDecoder()
+    best, i = None, s.find("{")
+    while i != -1:
+        try:
+            obj, end = dec.raw_decode(s, i)
+        except Exception:
+            i = s.find("{", i + 1)
+            continue
+        if isinstance(obj, dict):
+            best = obj                       # 뒤로 가며 갱신 -> 마지막 최상위 객체가 남는다
+        i = s.find("{", max(end, i + 1))
+    if best is None:
+        raise ValueError("no json object")
+    return best
+
+
+def exec_cursor(prompt, schema, timeout, model=None, cwd=None, tag=None, tools=None):
+    """Cursor Agent CLI headless (-p --mode ask). Read-only. There is no schema flag, so the schema is appended to the
+    prompt and enforced by validate() (failure = rework). Envelope: {"type":"result","subtype":"success",
+    "is_error":false,"result":"<text>","session_id":..,"usage":{"inputTokens","outputTokens",...}} — no cost, no model."""
+    cmd = cursor_cmd()
+    if not cmd:
+        return None, {"executor": "cursor", "error": "cursor-agent 를 찾지 못함: GE_CURSOR 를 설정", "duration_s": 0.0}
+    here = tempfile.mkdtemp(prefix="ge-cursor-")
+    full = (prompt + "\n\nOutput contract: reply with ONE JSON object matching this JSON Schema. "
+            "No prose, no code fences, no keys outside the schema.\n" + json.dumps(schema, ensure_ascii=False))
+    prompt_path = os.path.join(here, "prompt.txt")
+    with open(prompt_path, "w", encoding="utf-8") as f:
+        f.write(full)
+    model = model or os.environ.get("GE_CURSOR_MODEL")
+    cmd = cmd + ["-p", "--output-format", "json", "--mode", "ask", "--trust"] + (["--model", model] if model else [])
+    env = {"GE_WORKER": "1", "GE_CWD": cwd or PROJ}
+    # The CLI also runs the user's global hooks (~/.cursor/hooks.json, plugin hooks). When those break, every tool
+    # call is blocked. Point HOME/USERPROFILE/CURSOR_CONFIG_DIR at a clean temp dir (auth stays in the OS store).
+    # GE_CURSOR_ISOLATE=0 turns this off.
+    if os.environ.get("GE_CURSOR_ISOLATE", "1") != "0":
+        iso = os.environ.get("GE_CURSOR_CONFIG_DIR") or os.path.join(tempfile.gettempdir(), "ge-cursor-home")
+        os.makedirs(os.path.join(iso, ".cursor"), exist_ok=True)
+        env.update({"CURSOR_CONFIG_DIR": os.path.join(iso, ".cursor"), "USERPROFILE": iso, "HOME": iso})
+    t0 = time.time()
+    code, out, err = run_headless(cmd, here, timeout, env=env, stdin_file=prompt_path)
+    with open(os.path.join(here, "stdout.jsonl"), "w", encoding="utf-8", errors="replace") as f:
+        f.write(out)
+    meta = {"executor": "cursor", "duration_s": round(time.time() - t0, 1), "exit": code, "model": model, "call_dir": here}
+    if code is None:
+        meta["error"] = err or "timeout"
+        return None, meta
+    if code != 0 and not out.strip():
+        meta["error"] = err[-400:]
+        return None, meta
+    results = [l for l in _json_lines(out) if l.get("type") == "result"]
+    if not results:
+        meta["error"] = "stdout 에 result 없음"
+        if err:
+            meta["stderr"] = err[-200:]
+        return None, meta
+    raw = results[-1]
+    u = raw.get("usage") or {}
+    sid = raw.get("session_id") or ""
+    meta.update({"input_tokens": u.get("inputTokens"), "output_tokens": u.get("outputTokens"),
+                 "cache_read": u.get("cacheReadTokens"), "cache_write": u.get("cacheWriteTokens"),
+                 "session_sha": sha256_text(str(sid))[:12] if sid else None})
+    if raw.get("is_error") or raw.get("subtype") not in (None, "success"):
+        meta["error"] = str(raw.get("result") or raw.get("subtype"))[-400:]
+        return None, meta
+    text = raw.get("result")
+    if not isinstance(text, str):
+        meta["error"] = "result 없음"
+        return None, meta
+    try:
+        payload = _trailing_json(text)
+    except Exception:
+        meta["error"] = "result 가 JSON 이 아님"
+        meta["result_head"] = text[:120]
+        return None, meta
+    return payload, meta
+
+
+def _codex_strict_schema(schema):
+    """Codex/OpenAI strict JSON Schema copy.
+    GE 의 원본 schema 는 그대로 validate() 에 쓴다. 이 복사본만 모든 object 에
+    additionalProperties:false 와 properties 전체 required 를 채워 CLI strict 모드와 맞춘다."""
+    if isinstance(schema, list):
+        return [_codex_strict_schema(x) for x in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {k: _codex_strict_schema(v) for k, v in schema.items()}
+    if out.get("type") == "object" or "properties" in out:
+        props = out.get("properties") or {}
+        out["properties"] = {k: _codex_strict_schema(v) for k, v in props.items()}
+        out["additionalProperties"] = False
+        out["required"] = list(props.keys())
+    if "items" in out:
+        out["items"] = _codex_strict_schema(out["items"])
+    for key in ("anyOf", "oneOf", "allOf"):
+        if key in out:
+            out[key] = [_codex_strict_schema(x) for x in out[key]]
+    return out
+
+
+def _codex_model(model):
+    """CLI model name or None (= the CLI's own default). Provider-prefixed selectors are rejected."""
+    m = model or os.environ.get("GE_CODEX_MODEL")
+    if m and "/" in str(m):
+        return None, (f"Codex CLI model must be a CLI model name, not a provider selector {m!r}. "
+                      f"Use --model {str(m).split('/', 1)[1]!r}.")
+    return m, None
+
+
+def _codex_events(text):
+    events = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            pass
+    return events
+
+
+def _codex_event_error(events):
+    for ev in events:
+        typ = str(ev.get("type") or ev.get("event") or "")
+        if typ in ("turn.failed", "error") or typ.endswith(".failed"):
+            msg = ev.get("message") or ev.get("error") or ev.get("reason") or ev.get("content") or typ
+            if isinstance(msg, dict):
+                msg = msg.get("message") or msg.get("error") or msg
+            return str(msg)[-400:]
+        if ev.get("failed") is True or ev.get("is_error") is True:
+            msg = ev.get("error") or ev.get("message") or "codex error"
+            if isinstance(msg, dict):
+                msg = msg.get("message") or msg.get("error") or msg
+            return str(msg)[-400:]
+    return None
+
+
+def _first_present(d, *keys):
+    for k in keys:
+        if k in d:
+            return d.get(k)
+    return None
+
+
+def _codex_usage(events):
+    meta = {}
+    for ev in events:
+        sid = ev.get("session_id") or ev.get("sessionId") or ev.get("conversation_id") or ev.get("thread_id")
+        if sid and "session_sha" not in meta:
+            meta["session_sha"] = sha256_text(str(sid))[:12]
+        u = ev.get("usage") or ev.get("token_usage")
+        if not isinstance(u, dict) or not u:
+            continue
+        vals = {
+            "input_tokens": _first_present(u, "input_tokens", "inputTokens", "prompt_tokens"),
+            "output_tokens": _first_present(u, "output_tokens", "outputTokens", "completion_tokens"),
+            "cache_read": _first_present(u, "cache_read_input_tokens", "cacheReadTokens", "cached_input_tokens"),
+            "cache_write": _first_present(u, "cache_write_input_tokens", "cacheWriteTokens"),
+            "reasoning_output_tokens": _first_present(u, "reasoning_output_tokens", "reasoningOutputTokens"),
+        }
+        meta.update({k: v for k, v in vals.items() if v is not None})
+    return {k: v for k, v in meta.items() if v is not None}
+
+
+def exec_codex(prompt, schema, timeout, model=None, cwd=None, tag=None, tools=None):
+    """Codex CLI worker. Read-only sandbox, strict schema file, final JSON from --output-last-message.
+    No shell interpolation and no dangerous bypass. The worker cwd is passed with -C and via GE_CWD."""
+    cmd0 = codex_cmd()
+    if not cmd0:
+        return None, {"executor": "codex", "error": "codex 실행 파일을 찾지 못함: GE_CODEX 를 설정", "duration_s": 0.0}
+    model, model_err = _codex_model(model)
+    if model_err:
+        return None, {"executor": "codex", "error": model_err, "duration_s": 0.0}
+    here = tempfile.mkdtemp(prefix="ge-codex-")
+    prompt_path = os.path.join(here, "prompt.txt")
+    schema_path = os.path.join(here, "schema.json")
+    last_path = os.path.join(here, "last-message.txt")
+    with open(prompt_path, "w", encoding="utf-8") as f:
+        f.write(prompt + "\n\nReturn exactly one JSON object matching the supplied output schema. No prose, no fences.\n")
+    with open(schema_path, "w", encoding="utf-8") as f:
+        json.dump(_codex_strict_schema(schema), f, ensure_ascii=False)
+    run_cwd = cwd or PROJ
+    cmd = cmd0 + ["exec"] + (["--model", model] if model else []) + ["--sandbox", "read-only", "--json",
+                  "--output-schema", schema_path, "--output-last-message", last_path,
+                  "--ephemeral", "--ignore-user-config", "--skip-git-repo-check", "-C", run_cwd, "-"]
+    env = {"GE_WORKER": "1", "GE_CWD": run_cwd}
+    t0 = time.time()
+    code, out, err = run_headless(cmd, here, timeout, env=env, stdin_file=prompt_path)
+    for name, data in (("stdout.jsonl", out), ("stderr.txt", err)):
+        if data:
+            with open(os.path.join(here, name), "w", encoding="utf-8", errors="replace") as f:
+                f.write(data)
+    events = _codex_events(out)
+    meta = {"executor": "codex", "duration_s": round(time.time() - t0, 1), "exit": code,
+            "model": model, "call_dir": here}
+    meta.update(_codex_usage(events))
+    if code is None:
+        meta["error"] = err or "timeout"
+        return None, meta
+    ev_err = _codex_event_error(events)
+    if code != 0:
+        meta["error"] = (err or ev_err or out or "codex nonzero exit")[-400:]
+        return None, meta
+    if ev_err:
+        meta["error"] = ev_err
+        return None, meta
+    if not os.path.isfile(last_path):
+        meta["error"] = "output-last-message 없음"
+        return None, meta
+    text = _rt(last_path, encoding="utf-8", errors="replace")
+    if not text.strip():
+        meta["error"] = "output-last-message 비어 있음"
+        return None, meta
+    try:
+        payload = json.loads(_strip_fences(text))
+    except Exception:
+        meta["error"] = "result 가 JSON 이 아님"
+        meta["result_head"] = text[:120]
+        return None, meta
+    if not isinstance(payload, dict):
+        meta["error"] = "result 가 JSON object 가 아님"
+        return None, meta
+    return payload, meta
+
+
+EXECUTORS = {"claude": exec_claude, "codex": exec_codex, "cursor": exec_cursor, "grok": exec_grok, "stub": exec_stub}
+
+
+# ---------------- spec ----------------
+def lessons_path(spec_path, node):
+    return os.path.join(os.path.splitext(os.path.abspath(spec_path))[0], "lessons", node + ".md")
+
+
+def add_lesson(spec_path, node, text, run=None):
+    """Append one lesson line for a producing node: <spec>/lessons/<node>.md.
+    One line, date, optional run id. Long explanations belong in the prompt; here only "do not repeat this".
+    Lessons change role_sha, so `ge ledger --role` splits rework before/after the lesson."""
+    one = " ".join(text.split())
+    if not one:
+        raise SystemExit("빈 교훈")
+    path = lessons_path(spec_path, node)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    name = os.path.splitext(os.path.basename(spec_path))[0]
+    head = f"# {name}/{node} — 이 자리에서 배운 것\n\n" if not os.path.exists(path) else ""
+    line = f"- {datetime.date.today():%Y-%m-%d}" + (f" / run {run}" if run else "") + f" / {one}\n"
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(head + line)
+    lines = [l for l in _rt(path, encoding="utf-8").splitlines(True) if l.startswith("- ")]
+    return {"path": _rel(path), "lines": len(lines), "added": line.strip(),
+            "hint": f'명세의 {node} 노드에 "lessons": "{os.path.relpath(path, set_project_from_spec(spec_path))}" 를 걸어야 워커가 받는다',
+            "warn": "교훈이 12줄을 넘었다 — 묶거나 프롬프트로 올려라" if len(lines) > 12 else None}
+
+
+def load_spec(path):
+    set_project_from_spec(path)
+    if os.environ.get("GE_REQUIRE_FABRIC") == "1":          # opt-in: refuse to run until <spec>/fabric.md has a choice
+        fab = fabric.choice_problem(path)
+        assert fab is None, fab
+    spec = json.loads(_rt(path, encoding="utf-8"))
+    ids = [n["id"] for n in spec["nodes"]]
+    assert len(ids) == len(set(ids)), "노드 id 중복"
+    for n in spec["nodes"]:
+        for d in n.get("inputs", []):
+            assert d in ids, f"{n['id']} 의 입력 {d} 가 없다"
+        if n.get("args") is not None:
+            assert n.get("kind") == "script", f"{n['id']}: args 는 script 노드에만"
+            assert isinstance(n["args"], list) and all(isinstance(x, str) for x in n["args"]), f"{n['id']}: args 는 문자열 목록"
+        if n.get("cwd"):
+            # ${VAR}/%VAR% expand from the environment. Unset variables fail closed.
+            _cwd = os.path.expandvars(n["cwd"])
+            assert "${" not in _cwd and not re.search(r"%\w+%", _cwd), f"{n['id']}: cwd 환경변수 미설정: {n['cwd']}"
+            n["cwd"] = os.path.abspath(proj_path(_cwd))
+        if n.get("lessons"):
+            assert n.get("kind") != "verify", f"{n['id']}: 검사자에게 교훈을 주지 마라 (작가와 같은 눈이 된다)"
+            assert os.path.isfile(proj_path(n["lessons"])), f"{n['id']}: lessons 파일 없음 {n['lessons']}"
+        if n.get("verify_thinking") is not None:
+            assert n.get("kind") == "verify", f"{n['id']}: verify_thinking 은 verify 노드에만"
+            assert n["verify_thinking"] in ("low", "medium", "high"), f"{n['id']}: verify_thinking 은 low|medium|high"
+        if n.get("schema") is not None:
+            bad = schema_problems(n["schema"])
+            assert not bad, f"{n['id']}: schema — " + "; ".join(bad[:5])
+        if n.get("apply"):
+            # An apply node writes results. It must take a verify node as a direct input (checked again at run time).
+            kinds = {m["id"]: m.get("kind", "model") for m in spec["nodes"]}
+            assert n.get("kind") == "script", f"{n['id']}: apply 는 script 노드에만"
+            assert any(kinds.get(d) == "verify" for d in n.get("inputs", [])), \
+                f"{n['id']}: apply 노드는 verify 노드를 입력으로 받아야 한다"
+        if n.get("stub_output"):
+            assert os.path.isfile(proj_path(n["stub_output"])), f"{n['id']}: stub_output 파일 없음 {n['stub_output']}"
+    spec["_path"] = os.path.abspath(path)
+    # The contract (inputs, scope, runtime checks) is validated before the run starts. It is part of _sha:
+    # a changed contract is a different run.
+    spec["_contract"] = guard.validate_contract(spec, PROJ)
+    spec["_sha"] = sha256_text(json.dumps([spec["nodes"], spec.get("contract")], sort_keys=True, ensure_ascii=False))[:12]
+    return spec
+
+
+def contract_sha(spec_path, write=False):
+    """contract.inputs 마다 guard 와 같은 방식(CRLF→LF 정규화)으로 sha256 을 구한다. write 면 명세 파일의 sha256 을 갱신.
+    파일은 다시 직렬화한다(들여쓰기는 원본 감지). 읽지 못한 입력이 있으면 ok=False, 쓰지 않는다."""
+    set_project_from_spec(spec_path)
+    text = _rt(spec_path, encoding="utf-8", newline="")
+    spec = json.loads(text)
+    rows, ok = [], True
+    for it in (spec.get("contract") or {}).get("inputs", []):
+        try:
+            data = _rb(guard._abs(PROJ, it["path"]))
+        except OSError as e:
+            rows.append({"id": it["id"], "path": it["path"], "error": str(e.strerror or e)}); ok = False; continue
+        new = guard.sha256_bytes(data)
+        rows.append({"id": it["id"], "path": it["path"], "old": it.get("sha256"), "new": new, "changed": it.get("sha256") != new})
+        it["sha256"] = new
+    if write and ok and any(r["changed"] for r in rows):
+        m = re.search(r"^( +)\"", text, re.M)
+        eol = "\r\n" if "\r\n" in text else "\n"
+        out = json.dumps(spec, ensure_ascii=False, indent=len(m.group(1)) if m else 1)
+        with open(spec_path, "w", encoding="utf-8", newline="") as f:
+            f.write(out.replace("\n", eol))
+    return {"ok": ok, "written": bool(write and ok and any(r["changed"] for r in rows)), "inputs": rows}
+
+
+PATH_WARN_LEN = 200   # Windows MAX_PATH 260 에서 산출물 하위 경로 여유를 뺀 값
+
+
+def path_length_warnings(spec, run_id):
+    """런 폴더 + 가장 깊은 하위 경로가 Windows 한도(260)에 닿을지 plan 단계에서 경고한다."""
+    base = os.path.join(GE_DIR, "runs", run_id, "artifacts")
+    out = []
+    if sys.platform == "win32" and len(base) > PATH_WARN_LEN - 60:
+        out.append(f"런 폴더가 길다({len(base)}자): run-id 를 줄여라 → {base[:60]}…")
+    for n in spec["nodes"]:
+        p = os.path.join(base, n["id"] + "-a1-" + "x" * 40 + ".json")
+        if sys.platform == "win32" and len(p) > PATH_WARN_LEN:
+            out.append(f"노드 {n['id']}: 산출 경로 ~{len(p)}자 (한도 260). run-id·노드 id 를 줄여라")
+    return out
+
+
+def topo(spec):
+    """Topological order. Nodes that become ready together keep the order they are declared in the spec
+    (sorting by name silently dropped the author's order)."""
+    done, order = set(), []
+    nodes = {n["id"]: n for n in spec["nodes"]}
+    decl = {n["id"]: i for i, n in enumerate(spec["nodes"])}
+    while len(order) < len(nodes):
+        ready = [i for i, n in nodes.items() if i not in done and all(d in done for d in n.get("inputs", []))]
+        if not ready:
+            raise SystemExit("순환 의존")
+        order += sorted(ready, key=lambda i: decl[i])
+        done |= set(ready)
+    return order
+
+
+def read_rel(p):
+    return _rt(proj_path(p), encoding="utf-8")
+
+
+LESSON_HEADER = ("\n\n## 이 자리에서 이미 배운 것 (같은 실수를 두 번 하지 마라)\n"
+                "아래는 이 노드가 전에 실제로 틀렸던 것이다. 지시와 충돌하면 지시가 이긴다.\n\n")
+
+
+RETRY_FEEDBACK_MAX = 8
+
+
+def feedback_count(errs):
+    """retry_feedback 이 실제로 프롬프트에 붙일 오류 건수(상한 RETRY_FEEDBACK_MAX 이전의 전체 건수)."""
+    return len([e for e in (errs or []) if e and e != "never"])
+
+
+def retry_feedback(prompt, errs):
+    """재시도 프롬프트에 직전 시도의 실패 이유를 붙인다. 첫 시도(errs=None)는 그대로.
+
+    Retrying the same prompt repeats the same mistake. The validation and anchor errors are attached
+    as plain strings so the next attempt knows where it failed.
+    """
+    errs = [str(e) for e in (errs or []) if e and e != "never"]
+    if not errs:
+        return prompt
+    lines = "\n".join("- " + " ".join(e.split())[:400] for e in errs[:RETRY_FEEDBACK_MAX])
+    more = f"\n- (그 밖 {len(errs) - RETRY_FEEDBACK_MAX}건)" if len(errs) > RETRY_FEEDBACK_MAX else ""
+    return (prompt + "\n\n## 직전 시도가 실패한 이유 (코디가 검사한 결과)\n" + lines + more +
+            "\n위 이유를 고쳐 같은 형식으로 다시 답하라. 통과한 부분은 바꾸지 마라.\n")
+
+
+def render(node, produced, item=None, inputs_kv=None, contract=None):
+    txt = read_rel(node["prompt"]) if node.get("prompt") else ""
+    if node.get("rubric"):
+        txt = txt.replace("{{rubric}}", guard.strip_mechanical(read_rel(node["rubric"]), contract))   # mechanical items are filled by the probe
+    # Lessons go to producing nodes only. A checker that gets them sees with the author's eyes
+    # (same reason only the checker reads the rubric). load_spec refuses verify+lessons.
+    if node.get("lessons") and node.get("kind") != "verify":
+        txt += LESSON_HEADER + read_rel(node["lessons"]).strip() + "\n"
+    # Contract inputs go to every node (checker included) as the same text. Facts are not rubric.
+    # When the coordinator attaches them, a worker cannot "fail to read" them.
+    if contract:
+        txt += guard.render_inputs(contract, PROJ)
+    for dep in node.get("inputs", []):
+        txt = txt.replace("{{input." + dep + "}}", json.dumps(produced.get(dep), ensure_ascii=False, indent=1))
+    for k, v in (inputs_kv or {}).items():
+        txt = txt.replace("{{" + k + "}}", v)
+    if item is not None:
+        if isinstance(item, dict):
+            for k, v in item.items():
+                txt = txt.replace("{{item." + k + "}}", v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
+        txt = txt.replace("{{item}}", json.dumps(item, ensure_ascii=False))
+    return txt + f"\n\n[node:{node['id']}]"
+
+
+# ---------------- run ----------------
+def _rel(path):
+    """Path relative to the current directory (absolute if on another drive)."""
+    try:
+        return os.path.relpath(path)
+    except ValueError:
+        return path
+
+
+class Run:
+    def __init__(self, spec, run_id, executor, model=None, inputs_kv=None, max_cost=None,
+                 baseline=True, resume=None, resume_from=None):
+        self.spec, self.run_id, self.executor, self.model = spec, run_id, executor, model
+        self.baseline = baseline                      # 워커 전에 probe 를 원본에 한 번 돌린다 (--no-baseline 으로 끔)
+        self.resume, self.resume_from = resume, resume_from      # 이전 런 id, "guard"|"verify"
+        self.cause = None                             # 실패 원인 한 줄 (run_aborted / run_done 에 실린다)
+        self.inputs_kv = inputs_kv or {}
+        self.max_cost = max_cost          # 누적 비용 상한(USD). 실행자가 비용을 줄 때만 보인다 — Cursor 는 안 준다.
+        self.spent = 0.0
+        self.dir = os.path.join(GE_DIR, "runs", run_id)
+        os.makedirs(os.path.join(self.dir, "artifacts"), exist_ok=True)
+        self.ledger = open(os.path.join(self.dir, "ledger.jsonl"), "a", encoding="utf-8")
+        self.produced = {}
+        self.contract = spec.get("_contract")
+        self.preflights, self.probe_result, self.gate_result = [], None, None
+        self.ok_nodes = set()
+        self.call_error = None
+        # --input k=v 를 script 노드(라우터 등)도 읽을 수 있게 run 디렉터리에 남긴다. 본문은 사용자가 준 값뿐이다.
+        with open(os.path.join(self.dir, "inputs.json"), "w", encoding="utf-8") as f:
+            json.dump(self.inputs_kv, f, ensure_ascii=False, indent=1)
+
+    def log(self, **row):
+        row.setdefault("ts", now())
+        self.ledger.write(json.dumps(row, ensure_ascii=False) + "\n"); self.ledger.flush()
+
+    def capped(self):
+        return self.max_cost is not None and self.spent >= self.max_cost
+
+    def call(self, node, prompt, attempt, fb_errs=None):
+        ex = node.get("executor", self.executor)
+        fb_n = feedback_count(fb_errs)        # 이 호출 프롬프트에 붙은 직전 오류 건수 (계측 전용)
+        fb = {"retry_feedback": fb_n > 0, "feedback_errors": fb_n}
+        if self.executor == "stub":
+            ex = "stub"                            # a stub run never calls a real model
+        fn = EXECUTORS[ex.split(":")[0]]           # "claude:other" = same CLI, separate call
+        schema = VERDICTS_SCHEMA if node.get("kind") == "verify" and "schema" not in node else node["schema"]
+        if self.capped():
+            errs = [f"비용 상한 초과: ${self.spent:.4f} >= ${self.max_cost}"]
+            self.log(event="call", node=node["id"], attempt=attempt, ok=False, errors=errs, executor=ex,
+                     error=errs[0], spent_usd=round(self.spent, 4), capped=True, **fb)
+            return None, errs
+        cwd = node.get("cwd")                      # run the worker in this folder (spec-relative allowed)
+        if cwd and not os.path.isabs(cwd):
+            cwd = proj_path(cwd)
+        model = node.get("model") or self.model
+        if node.get("kind") == "verify" and node.get("verify_thinking") and model:
+            model = re.sub(r"-thinking-\w+$", "-thinking-" + node["verify_thinking"], model)
+        if ex == "stub" and node.get("stub_output"):
+            # canned output for offline examples and tests. It still goes through validate().
+            payload = json.loads(_rt(proj_path(node["stub_output"]), encoding="utf-8"))
+            meta = {"executor": "stub", "duration_s": 0.0, "model": "stub", "input_tokens": 0, "output_tokens": 0,
+                    "cost_usd": 0.0, "stub_output": node["stub_output"]}
+        else:
+            payload, meta = fn(prompt, schema, node.get("timeout", 600), model, cwd=cwd,
+                               tag=f"{self.run_id}-{node['id']}-a{attempt}", tools=node.get("tools"))
+        self.spent += meta.get("cost_usd") or 0.0
+        errs = validate(payload, schema) if payload is not None else [meta.get("error", "no payload")]
+        # Real workers only: a placeholder patch whose old_str is not in the file is rejected here.
+        # The stub fills placeholders, so its anchors are not checked.
+        if not errs and payload is not None and ex.split(":")[0] in ("cursor", "grok", "claude", "codex"):
+            errs += patch_old_str_anchors(payload, cwd or PROJ)
+        self.log(event="call", node=node["id"], attempt=attempt, ok=not errs, errors=errs[:5],
+                 spent_usd=round(self.spent, 4), **fb, **meta)
+        if errs:
+            self.call_error = f"{node['id']}: {errs[0]}"[:300]
+        return (payload if not errs else None), errs
+
+    def route_allows(self, node):
+        """Return (allowed, reason). `when` routes a node on an upstream artifact value.
+
+        when: {"node": "route", "key": "branch", "equals": "code"}
+        when: {"node": "route", "key": "branch", "in": ["code", "doc"]}
+        Missing upstream/keys are treated as a skip, never as an error.
+        """
+        cond = node.get("when")
+        if not cond:
+            return True, None
+        if not isinstance(cond, dict) or not cond.get("node"):
+            return False, "when 형식 오류 (node 필요)"
+        src = self.produced.get(cond["node"])
+        if src is None:
+            return False, f"when 상류 없음: {cond['node']}"
+        val = src
+        for part in str(cond.get("key", "branch")).split("."):
+            if isinstance(val, dict) and part in val:
+                val = val[part]
+            else:
+                return False, f"when 키 없음: {cond.get('key', 'branch')}"
+        if "equals" in cond:
+            ok = val == cond["equals"]
+            return ok, None if ok else f"when 불일치: {val!r} != {cond['equals']!r}"
+        if "in" in cond:
+            allowed = cond["in"] if isinstance(cond["in"], list) else [cond["in"]]
+            ok = val in allowed
+            return ok, None if ok else f"when 불일치: {val!r} not in {allowed!r}"
+        return False, "when 조건 없음 (equals 또는 in)"
+
+    def _guard_artifact(self, name, payload):
+        path = os.path.join(self.dir, "artifacts", name + ".json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        return path
+
+    def guard_preflight(self, node):
+        """모델 호출 전. 계약 입력을 코디가 읽고(해시 대조) 워커 cwd 에서도 닿는지 본다. 실패 = 노드 시작 안 함."""
+        pre = guard.preflight(self.contract, node, PROJ)
+        self.preflights.append(pre)
+        path = self._guard_artifact("guard-preflight-" + node["id"], pre)
+        self.log(event="guard", phase="preflight", node=node["id"], ok=pre["ok"], problems=pre["problems"][:5],
+                 artifact=_rel(path))
+        if not pre["ok"]:
+            self.cause = f"preflight {node['id']}: {pre['problems'][0]}"
+        return pre["ok"]
+
+    def guard_baseline(self):
+        """Run the probe once on the original (an empty run folder, no patch) before any worker.
+        If the original already violates the probe, the facts are wrong: stop before paying for a worker.
+        The probe gets GE_PROBE_BASELINE=1."""
+        c = self.contract
+        if not (self.baseline and c and c.get("runtime_checks") and c.get("probe")):
+            return True
+        tmp = tempfile.mkdtemp(prefix="ge-baseline-")
+        try:
+            res = guard.run_probe(c, tmp, PROJ, baseline=True)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        path = self._guard_artifact("guard-baseline", res)
+        self.log(event="guard", phase="baseline", ok=res["ok"], problems=res["problems"][:5],
+                 checks={x["id"]: bool(x.get("ok")) for x in res.get("checks", [])}, artifact=_rel(path))
+        if not res["ok"]:
+            self.cause = "facts 오류 — 원본(패치 전)이 이미 probe 위반: " + res["problems"][0]
+            print("facts 오류: 원본이 이미 probe 를 통과하지 못한다. 워커를 부르지 않았다.", file=sys.stderr)
+            for pr in res["problems"]:
+                print("  - " + pr, file=sys.stderr)
+            print("  probe/facts 를 고치거나 --no-baseline 으로 끈다.", file=sys.stderr)
+        return res["ok"]
+
+    def guard_probe(self, node):
+        """생산 노드 산출 뒤. probe 스크립트를 격리 실행해 checks 를 남긴다. 계약에 runtime_checks 가 있을 때만."""
+        if not self.contract or not self.contract.get("runtime_checks"):
+            return True
+        if self.resume_from == "verify":         # probe 재사용: 이전 런의 결과를 그대로 (verify 부터 다시)
+            old = os.path.join(GE_DIR, "runs", self.resume, "artifacts", "guard-probe.json")
+            if os.path.isfile(old):
+                self.probe_result = json.loads(_rt(old, encoding="utf-8"))
+                self._guard_artifact("guard-probe", self.probe_result)
+                self.log(event="guard", phase="runtime_probe", node=node["id"], ok=self.probe_result["ok"],
+                         problems=self.probe_result["problems"][:5], resumed_from=self.resume)
+                if not self.probe_result["ok"]:
+                    self.cause = "probe: " + self.probe_result["problems"][0]
+                return self.probe_result["ok"]
+        res = guard.run_probe(self.contract, self.dir, PROJ)
+        res["after_node"] = node["id"]
+        self.probe_result = res
+        path = self._guard_artifact("guard-probe", res)
+        self.log(event="guard", phase="runtime_probe", node=node["id"], ok=res["ok"], problems=res["problems"][:5],
+                 recorded=res.get("recorded", [])[:5],          # record_only 검사의 낙제 — 기록만, 런은 계속
+                 checks={c["id"]: bool(c.get("ok")) for c in res.get("checks", [])}, artifact=_rel(path))
+        if not res["ok"]:
+            self.cause = "probe: " + (res["problems"][0] if res["problems"] else "실패")
+        return res["ok"]
+
+    def guard_gate(self, node, payload):
+        """verify 산출 뒤. verify fail/unverifiable · probe 실패 · requires 매핑 · 범위 밖 항목 · preflight 잔여.
+        하나라도 걸리면 False -> Run.run 이 run_aborted. verify verdict 는 건드리지 않는다."""
+        res = guard.acceptance_gate(self.contract, self.dir, self.produced, payload, self.probe_result, self.preflights)
+        self.gate_result = res
+        path = self._guard_artifact("guard-acceptance", res)
+        self.log(event="guard", phase="acceptance_gate", node=node["id"], ok=res["ok"],
+                 blocks=[b.get("rule") for b in res["blocks"]][:8],
+                 needs_approval=[x["key"] for x in res["needs_approval"]][:8], artifact=_rel(path))
+        if not res["ok"]:
+            b = res["blocks"][0]
+            self.cause = "gate " + b.get("rule", "") + (f" {b['item']}" if b.get("item") else "") + ": " + (b.get("why") or "")[:160]
+        return res["ok"]
+
+    def resume_payload(self, node):
+        """--resume: 이전 런의 artifacts/<노드>.json 을 재사용할 수 있으면 payload, 아니면 None (model 노드만, 스키마 통과 시)."""
+        if not self.resume or node.get("kind", "model") != "model" or node.get("fanout") or "schema" not in node:
+            return None
+        p = os.path.join(GE_DIR, "runs", self.resume, "artifacts", node["id"] + ".json")
+        if not os.path.isfile(p):
+            return None
+        payload = json.loads(_rt(p, encoding="utf-8"))
+        return payload if payload and not validate(payload, node["schema"]) else None
+
+    def apply_block(self, node):
+        """An apply node runs only if every input succeeded, every verify input has only `pass` verdicts,
+        and (with a contract) the acceptance gate passed. Returns the reason to block, or None.
+        This holds with or without a contract and regardless of `required` on upstream nodes."""
+        for d in node.get("inputs", []):
+            if d not in self.ok_nodes:
+                return f"입력 {d} 이(가) 성공하지 않았다"
+            dn = next(n for n in self.spec["nodes"] if n["id"] == d)
+            if dn.get("kind") == "verify":
+                vs = (self.produced.get(d) or {}).get("verdicts") or []
+                bad = [v.get("item_id") for v in vs if v.get("verdict") != "pass"]
+                if not vs or bad:
+                    return f"verify {d} 가 통과하지 않았다: " + (", ".join(map(str, bad)) or "판정 없음")
+        if self.contract is not None and not (self.gate_result or {}).get("ok"):
+            return "acceptance gate 를 통과하지 않았다"
+        return None
+
+    def run_node(self, node):
+        nid = node["id"]
+        allowed, reason = self.route_allows(node)
+        if not allowed:
+            self.produced[nid] = {"skipped": True, "reason": reason}
+            path = os.path.join(self.dir, "artifacts", f"{nid}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.produced[nid], f, ensure_ascii=False, indent=1)
+            self.log(event="node_skipped", node=nid, kind=node.get("kind", "model"), reason=reason,
+                     role=role_id(self.spec, node), artifact=_rel(path))
+            return True
+        self.log(event="node_started", node=nid, kind=node.get("kind", "model"), role=role_id(self.spec, node),
+                 role_sha=role_sha(node), model=node.get("model") or self.model, executor=node.get("executor", self.executor))
+        gerr = grok_generate_requires_read(node, self.executor)
+        if gerr:
+            self.produced[nid] = {}
+            self.log(event="node_done", node=nid, ok=False, artifact=None, artifact_sha=None, verdict=None, why=gerr)
+            return False
+        if node.get("apply"):
+            why = self.apply_block(node)
+            if why:
+                self.produced[nid] = {}
+                self.cause = f"apply {nid}: {why}"
+                self.log(event="node_done", node=nid, ok=False, artifact=None, artifact_sha=None, verdict=None, why=why)
+                return False
+        reuse = self.resume_payload(node)
+        if reuse is None and self.contract is not None and node.get("kind") != "script" and not self.guard_preflight(node):
+            self.produced[nid] = {}
+            self.log(event="node_done", node=nid, ok=False, artifact=None, artifact_sha=None, verdict=None,
+                     why="preflight 실패 — 워커를 부르지 않았다")
+            return False
+        if reuse is not None:
+            payload, ok = reuse, True          # resume: 이전 런 산출 재사용 — 워커를 부르지 않는다
+            self.log(event="node_resumed", node=nid, resumed_from=self.resume, from_stage=self.resume_from)
+        elif node.get("kind") == "script":
+            r = subprocess.run([sys.executable, proj_path(node["script"]), self.dir, *node.get("args", [])], cwd=PROJ,
+                               capture_output=True, text=True, encoding="utf-8",
+                               env={**os.environ, "GE_HOME": GE_HOME, "GE_PROJ": PROJ})   # scripts find ge_lib via GE_HOME
+            code, out = r.returncode, r.stdout.strip()
+            try:
+                payload = json.loads(out) if out else {}
+            except Exception:
+                payload = {"raw": out[-2000:]}
+            self.log(event="script", node=nid, exit=code, ok=code == 0)
+            ok = code == 0
+            if not ok:
+                self.call_error = f"{nid} script exit {code}: " + ((r.stderr or "").strip().splitlines() or [""])[-1][:200]
+        else:
+            items = self.produced.get(node["fanout"], {}).get("items") if node.get("fanout") else None
+            retry = node.get("retry", 1)
+            if items is not None:
+                results = [None] * len(items)
+                def one(i):
+                    p, e = None, ["never"]
+                    for a in range(1, retry + 2):
+                        base = render(node, self.produced, items[i], self.inputs_kv, self.contract)
+                        fe = e if a > 1 else None
+                        p, e = self.call(node, retry_feedback(base, fe), a, fe)
+                        if p is not None or self.capped():
+                            break                      # 상한에 걸렸으면 재시도해도 안 풀린다
+                    results[i] = p
+                with ThreadPoolExecutor(max_workers=node.get("parallel", 4)) as pool:
+                    list(pool.map(one, range(len(items))))
+                payload = {"items": [r for r in results if r is not None]}
+                ok = all(r is not None for r in results)
+            else:
+                payload, errs = None, ["never"]
+                for a in range(1, retry + 2):
+                    base = render(node, self.produced, None, self.inputs_kv, self.contract)
+                    fe = errs if a > 1 else None
+                    payload, errs = self.call(node, retry_feedback(base, fe), a, fe)
+                    if payload is not None or self.capped():
+                        break
+                ok = payload is not None
+                payload = payload or {}
+        if (node.get("kind") == "verify" and ok and self.contract and isinstance(payload, dict)
+                and self.contract.get("mechanical")):
+            # mechanical items are not judged by the model; the probe result fills them. The probe wins.
+            mv = guard.mechanical_verdicts(self.contract, self.probe_result)
+            mine = {v["item_id"] for v in mv}
+            payload = {**payload, "verdicts": [v for v in payload.get("verdicts", []) if v.get("item_id") not in mine] + mv}
+        self.produced[nid] = payload
+        path = os.path.join(self.dir, "artifacts", f"{nid}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        verdict = None
+        if node.get("kind") == "verify" and "verdicts" in payload:
+            vs = payload["verdicts"]
+            verdict = {"pass": sum(v["verdict"] == "pass" for v in vs), "fail": sum(v["verdict"] == "fail" for v in vs),
+                       "unverifiable": sum(v["verdict"] == "unverifiable" for v in vs)}
+        self.log(event="node_done", node=nid, ok=ok, artifact=_rel(path),
+                 artifact_sha=sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=False))[:12], verdict=verdict)
+        if not ok:
+            return ok
+        # Deterministic hooks, only for specs with a contract: after a producing node (model or script node that
+        # emits patches/new_files) run the probe; after verify run the acceptance gate. With a contract, a single
+        # fail/unverifiable verdict aborts the run. Without a contract, a verify fail is recorded and the run goes on.
+        kind = node.get("kind", "model")
+        if self.contract is None:
+            return ok
+        if kind == "verify":
+            return self.guard_gate(node, payload)
+        if kind in ("model", "script") and isinstance(payload, dict) and ("patches" in payload or "new_files" in payload):
+            return self.guard_probe(node)
+        return ok
+
+    def run(self):
+        self.log(event="run_started", run=self.run_id, spec=self.spec["name"], spec_sha=self.spec["_sha"],
+                 spec_path=self.spec.get("_path"), ge_sha=ge_sha(), executor=self.executor, model=self.model,
+                 host=socket.gethostname(),
+                 **({"resumed_from": self.resume, "from_stage": self.resume_from} if self.resume else {}))
+        ok_all = True
+        try:
+            if self.resume:
+                if not any(self.resume_payload(n) is not None for n in self.spec["nodes"]):
+                    self.cause = f"resume 할 산출이 없다: {self.resume}/artifacts"
+                    self.log(event="run_aborted", node=None, cause=self.cause)
+                    self.log(event="run_done", ok=False, cause=self.cause)
+                    return False
+            elif not self.guard_baseline():
+                self.log(event="run_aborted", node=None, cause=self.cause)
+                self.log(event="run_done", ok=False, cause=self.cause)
+                return False
+            first_cause = None
+            for nid in topo(self.spec):
+                node = next(n for n in self.spec["nodes"] if n["id"] == nid)
+                self.cause = self.call_error = None
+                ok = self.run_node(node)
+                if ok:
+                    self.ok_nodes.add(nid)
+                ok_all = ok_all and ok
+                if not ok:
+                    first_cause = first_cause or self.cause or self.call_error or f"{nid} 노드 실패"
+                    self.cause = first_cause
+                if not ok and node.get("required", True):
+                    self.log(event="run_aborted", node=nid, cause=self.cause); break
+            self.cause = first_cause if not ok_all else None
+            self.log(event="run_done", ok=ok_all, **({"cause": self.cause} if self.cause else {}))
+        finally:
+            self.ledger.close()          # close even on exceptions (Windows cannot delete open files)
+        return ok_all
+
+
+# ---------------- ledger ----------------
+def role_id(spec, node):
+    """역할 = 명세이름/노드id. 여러 run 에 걸쳐 같은 일을 하는 워커 자리."""
+    return f"{spec.get('name')}/{node['id']}"
+
+
+def role_sha(node):
+    """Hash of what the role is told = prompt + rubric + lessons + script. Splits the ledger before/after a lesson."""
+    bits = []
+    for k in ("prompt", "rubric", "lessons", "script"):
+        p = node.get(k)
+        if not p:
+            continue
+        try:
+            bits.append(k + ":" + read_rel(p))
+        except Exception:
+            bits.append(k + ":?" + str(p))
+    return sha256_text("\n".join(bits))[:12] if bits else None
+
+
+def ledger_rows(ge_dir=None):
+    """모든 run 의 원장을 읽어 (run, spec, 이벤트) 로 편다. 본문 없음."""
+    root = os.path.join(ge_dir or GE_DIR, "runs")
+    out = []
+    for run in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        path = os.path.join(root, run, "ledger.jsonl")
+        if not os.path.isfile(path):
+            continue
+        spec, started = None, None
+        for line in _rt(path, encoding="utf-8").splitlines(True):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("event") == "run_started":
+                spec, started = d.get("spec"), d.get("ts")
+            out.append({"run": run, "spec": spec, "run_started": started, **d})
+    return out
+
+
+def roles_table(rows, spec=None, role=None, since=None):
+    """역할별 집계. 같은 역할의 role_sha 별로도 쪼갠다 — 교훈 전/후 비교의 단위.
+
+    fail  = 스키마·실행 실패(재작업 유발). verdict = 그 노드가 verify 일 때 판정 합계.
+    cost  = 실행자가 준 값만. Cursor 는 가격을 안 줘서 0 이다(토큰으로 봐라).
+    """
+    node_role = {}
+    for r in rows:
+        if r.get("event") == "node_started" and r.get("role"):
+            node_role[(r["run"], r.get("node"))] = (r["role"], r.get("role_sha"))
+    agg = {}
+    for r in rows:
+        if since and (r.get("run_started") or "") < since:
+            continue
+        nid = r.get("node")
+        if not nid:
+            continue
+        rid, rsha = node_role.get((r["run"], nid), (f"{r.get('spec')}/{nid}", None))
+        if spec and not rid.startswith(spec + "/"):
+            continue
+        if role and role != rid:
+            continue
+        a = agg.setdefault((rid, rsha), {"role": rid, "role_sha": rsha, "runs": set(), "calls": 0, "fail": 0,
+                                         "rework": 0, "rw": {"fb": [0, 0], "nofb": [0, 0], "unknown": [0, 0]}, "verdict_pass": 0, "verdict_fail": 0, "verdict_unver": 0,
+                                         "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "models": set(),
+                                         "executors": set(), "reasons": [], "last": None})
+        a["runs"].add(r["run"])
+        a["last"] = max(a["last"] or "", r.get("ts") or "")
+        if r["event"] == "node_started":
+            if r.get("model"):
+                a["models"].add(r["model"])
+            if r.get("executor"):
+                a["executors"].add(r["executor"])
+        elif r["event"] == "call":
+            a["calls"] += 1
+            a["tokens_in"] += r.get("input_tokens") or 0
+            a["tokens_out"] += r.get("output_tokens") or 0
+            a["cost_usd"] += r.get("cost_usd") or 0.0
+            if r.get("model"):
+                a["models"].add(r["model"])
+            if r.get("attempt", 1) > 1:
+                a["rework"] += 1
+                k = "unknown" if "retry_feedback" not in r else ("fb" if r["retry_feedback"] else "nofb")
+                a["rw"][k][0] += 1                    # 재작업 호출 수
+                a["rw"][k][1] += 1 if r.get("ok") else 0   # 그중 통과
+            if not r.get("ok"):
+                a["fail"] += 1
+                a["reasons"] += [" ".join(str(e).split())[:80] for e in (r.get("errors") or [])]
+        elif r["event"] == "node_done" and r.get("verdict"):
+            v = r["verdict"]
+            a["verdict_pass"] += v.get("pass", 0)
+            a["verdict_fail"] += v.get("fail", 0)
+            a["verdict_unver"] += v.get("unverifiable", 0)
+    out = []
+    for a in agg.values():
+        vt = a["verdict_pass"] + a["verdict_fail"] + a["verdict_unver"]
+        rw = a.pop("rw")
+        out.append({**a, "rework_fb": rw["fb"][0], "rework_fb_ok": rw["fb"][1],
+                    "rework_nofb": rw["nofb"][0], "rework_nofb_ok": rw["nofb"][1],
+                    "rework_unknown": rw["unknown"][0], "rework_unknown_ok": rw["unknown"][1], "runs": len(a["runs"]), "models": sorted(a["models"]), "executors": sorted(a["executors"]),
+                    "cost_usd": round(a["cost_usd"], 4), "verdict_total": vt,
+                    "verdict_rate": round(a["verdict_pass"] / vt, 3) if vt else None,
+                    "rework_rate": round(a["rework"] / a["calls"], 3) if a["calls"] else None,
+                    "top_reasons": [r for r, _ in collections.Counter(a["reasons"]).most_common(3)]})
+    for o in out:
+        o.pop("reasons", None)
+    return sorted(out, key=lambda o: (-o["calls"], o["role"]))
+
+
+def format_roles(table):
+    w = max([len(o["role"]) for o in table] + [6])
+    lines = [f"{'역할'.ljust(w)}  {'sha':12}  {'run':>3} {'call':>4} {'재작업':>6} {'실패':>4}  {'합격':>9}  {'토큰in':>8} {'토큰out':>7}  {'비용$':>7}  모델"]
+    for o in table:
+        vr = f"{o['verdict_pass']}/{o['verdict_total']}" if o["verdict_total"] else "-"
+        lines.append(f"{o['role'].ljust(w)}  {(o['role_sha'] or '-'):12}  {o['runs']:>3} {o['calls']:>4} "
+                     f"{o['rework']:>6} {o['fail']:>4}  {vr:>9}  {o['tokens_in']:>8} {o['tokens_out']:>7}  "
+                     f"{o['cost_usd']:>7}  {','.join(m.split('-')[0] for m in o['models']) or '-'}")
+        if o["rework"]:
+            lines.append(" " * (w + 2) + f"└ 재작업 뒤 통과: 피드백있음 {o['rework_fb_ok']}/{o['rework_fb']} · "
+                         f"없음 {o['rework_nofb_ok']}/{o['rework_nofb']} · unknown {o['rework_unknown_ok']}/{o['rework_unknown']}")
+        if o["top_reasons"]:
+            lines.append(" " * (w + 2) + "└ 실패이유: " + " | ".join(o["top_reasons"]))
+    return "\n".join(lines)
+
+
+def metrics(run_dir):
+    """원장 -> 지표 5개. 본문 없음."""
+    rows = [json.loads(l) for l in _rt(os.path.join(run_dir, "ledger.jsonl"), encoding="utf-8").splitlines(True) if l.strip()]
+    start = next((r for r in rows if r["event"] == "run_started"), {})
+    calls = [r for r in rows if r["event"] == "call"]
+    nodes_done = [r for r in rows if r["event"] == "node_done"]
+    # 1) 합격률: verify 노드 verdict 합계
+    vp = sum((r.get("verdict") or {}).get("pass", 0) for r in nodes_done)
+    vf = sum((r.get("verdict") or {}).get("fail", 0) for r in nodes_done)
+    # 2) 재작업과 원인: attempt>1 인 호출. 원인 = 직전 시도의 오류 종류
+    rework = [r for r in calls if r["attempt"] > 1]
+    cause = {}
+    for r in rework:
+        prev = next((p for p in calls if p["node"] == r["node"] and p["attempt"] == r["attempt"] - 1), {})
+        k = "schema" if any("필수" in e or "허용" in e or "아님" in e or "enum" in e or "길이" in e for e in prev.get("errors", [])) else \
+            "worker-error" if prev.get("error") else "other"
+        cause[k] = cause.get(k, 0) + 1
+    # 3) 토큰·비용
+    tok_in = sum(r.get("input_tokens") or 0 for r in calls)
+    tok_out = sum(r.get("output_tokens") or 0 for r in calls)
+    cost = round(sum(r.get("cost_usd") or 0 for r in calls), 4)
+    # 4) 규칙·명세 버전 = start 에 있음
+    # 5) 사람 개입
+    notes = [r for r in rows if r["event"] == "note"]
+    # 6) node table: how the work was split and where rework happened, one line per node.
+    nodes = node_table(rows)
+    models = [r.get("model") for r in calls if r.get("model")]
+    uniq = list(dict.fromkeys(models))
+    model = start.get("model") or (uniq[0] if len(uniq) == 1 else ",".join(uniq) if uniq else None)
+    return {"run": start.get("run"), "spec": start.get("spec"), "spec_sha": start.get("spec_sha"),
+            "ge_sha": start.get("ge_sha"), "executor": start.get("executor"),
+            "model": model, "started": start.get("ts"),
+            "ok": next((r["ok"] for r in rows if r["event"] == "run_done"), None),
+            "nodes": len(nodes_done), "calls": len(calls),
+            "verify_pass": vp, "verify_fail": vf,
+            "rework": len(rework), "rework_cause": cause,
+            "tokens_in": tok_in, "tokens_out": tok_out, "cost_usd": cost,
+            "human_interventions": len(notes),
+            "node_table": nodes}
+
+
+def node_table(rows):
+    """원장 -> 노드별 요약 리스트 (위상 순서 = node_started 순). 본문·산출물 내용 없음.
+
+    필드: id, kind, calls(호출 수), attempts_max(한 항목 최대 시도), fanout(항목 수 | null),
+          ok, verdict(verify 만), artifact_sha(12), errors(마지막 실패 종류 최대 3개), started/ended.
+    """
+    order, info = [], {}
+    for r in rows:
+        ev, nid = r.get("event"), r.get("node")
+        if not nid:
+            continue
+        if nid not in info:
+            order.append(nid)
+            info[nid] = {"id": nid, "kind": None, "calls": 0, "attempts_max": 0, "fanout": None,
+                         "ok": None, "verdict": None, "artifact_sha": None, "errors": [],
+                         "started": None, "ended": None}
+        n = info[nid]
+        if ev == "node_started":
+            n["kind"] = r.get("kind", "model"); n["started"] = r.get("ts")
+        elif ev == "call":
+            n["calls"] += 1
+            n["attempts_max"] = max(n["attempts_max"], r.get("attempt") or 0)
+            if not r.get("ok"):
+                for e in (r.get("errors") or [])[:3]:
+                    kind = ("schema" if any(t in e for t in ("필수", "허용", "아님", "enum", "길이")) else
+                            "worker-error" if r.get("error") else "other")
+                    if kind not in n["errors"]:
+                        n["errors"].append(kind)
+        elif ev == "script":
+            n["calls"] += 1; n["attempts_max"] = max(n["attempts_max"], 1)
+            if not r.get("ok") and "script-exit" not in n["errors"]:
+                n["errors"].append("script-exit")
+        elif ev == "node_done":
+            n["ok"] = r.get("ok"); n["verdict"] = r.get("verdict"); n["artifact_sha"] = r.get("artifact_sha")
+            n["ended"] = r.get("ts")
+        elif ev == "run_aborted":
+            n["ok"] = False if n["ok"] is None else n["ok"]
+    # fanout 항목 수: 같은 노드에 attempt=1 호출이 여러 개면 그 수가 항목 수
+    first_attempts = {}
+    for r in rows:
+        if r.get("event") == "call" and r.get("attempt") == 1:
+            first_attempts[r["node"]] = first_attempts.get(r["node"], 0) + 1
+    for nid, cnt in first_attempts.items():
+        if cnt > 1 and nid in info:
+            info[nid]["fanout"] = cnt
+    return [info[n] for n in order]
+
+
+def _call_text(call_dir):
+    """호출 디렉터리에서 워커가 실제로 뱉은 전문을 꺼낸다. cursor=stream-json 의 마지막 result,
+    grok=end 이벤트의 structuredOutput, 아니면 stdout 원문."""
+    if not call_dir or not os.path.isdir(call_dir):
+        return None, "call_dir 없음 (옛 런이거나 임시 디렉터리가 지워졌다)"
+    for name in ("stdout.jsonl", "stdout.json"):
+        p = os.path.join(call_dir, name)
+        if not os.path.exists(p):
+            continue
+        raw = _rt(p, encoding="utf-8-sig", errors="replace")
+        lines = _json_lines(raw)
+        for l in reversed(lines):
+            if l.get("type") == "result" and isinstance(l.get("result"), str):
+                return l["result"], f"{name}: cursor result ({len(l['result'])}자)"
+            if l.get("type") == "end":
+                so = l.get("structuredOutput")
+                if so is not None:
+                    return json.dumps(so, ensure_ascii=False, indent=1), f"{name}: grok structuredOutput"
+        return raw, f"{name}: 원문 그대로 ({len(raw)}자)"
+    return None, "stdout 파일 없음: " + call_dir
+
+
+def trace(run_dir, node=None, attempt=None, out=None):
+    """Dump a worker's raw output. The ledger keeps only a 120-char head, which often hides the cause.
+    Writes to a file by default — do not paste raw output into a chat."""
+    path = os.path.join(run_dir, "ledger.jsonl")
+    if not os.path.isfile(path):
+        return {"ok": False, "error": "원장 없음: " + path}
+    calls = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("event") == "call":
+                calls.append(d)
+    picked = [c for c in calls
+              if (node is None or c.get("node") == node) and (attempt is None or c.get("attempt") == attempt)]
+    if node is None and attempt is None:
+        bad = [c for c in picked if not c.get("ok")]
+        picked = bad or picked[-1:]                 # 안 고르면 실패한 것들, 그것도 없으면 마지막
+    items = []
+    for c in picked:
+        cdir = c.get("call_dir")
+        text, how = _call_text(cdir)
+        item = {"node": c.get("node"), "attempt": c.get("attempt"), "ok": c.get("ok"),
+                "errors": c.get("errors"), "executor": c.get("executor"), "model": c.get("model"),
+                "call_dir": cdir, "source": how, "chars": len(text) if text else 0}
+        if text is not None:
+            dst = out or os.path.join(run_dir, "artifacts", f"trace-{c.get('node')}-a{c.get('attempt')}.txt")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            item["written"] = _rel(dst)
+            item["head"] = " ".join(text[:200].split())
+        items.append(item)
+    return {"ok": True, "calls": len(calls), "traced": items,
+            "note": "원문은 파일에 있다. 대화창에 붙이지 말고 필요한 조각만 코드로 꺼내라."}
+
+
+# ---------------- topology stats (ge stats --topologies) ----------------
+def _iter_spec_files(spec_roots):
+    seen = set()
+    for root in spec_roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for path in sorted(glob.glob(os.path.join(root, "*.json"))):
+            ap = os.path.abspath(path)
+            if ap not in seen:
+                seen.add(ap)
+                yield path
+
+
+def _load_spec_for_stats(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("nodes"), list):
+        return None
+    if not obj.get("name"):
+        obj["name"] = os.path.splitext(os.path.basename(path))[0]
+    return obj
+
+
+def _node_topology_label(node, include_ids=False):
+    kind = node.get("kind", "model")
+    label = f"{node.get('id', '?')}:{kind}" if include_ids else kind
+    flags = []
+    if node.get("fanout"):
+        flags.append("fanout")
+    if node.get("tools"):
+        flags.append("tools=" + str(node.get("tools")))
+    if node.get("when"):
+        flags.append("routed")
+    return label + ("[" + ",".join(flags) + "]" if flags else "")
+
+
+def spec_topology_signature(spec, include_ids=False):
+    """Hashable, body-free graph signature of a spec: node kinds in declaration order + edges."""
+    nodes = spec.get("nodes") or []
+    id_to_idx = {n.get("id"): i for i, n in enumerate(nodes)}
+    labels = tuple(_node_topology_label(n, include_ids=include_ids) for n in nodes)
+    edges = []
+    for i, node in enumerate(nodes):
+        for src in node.get("inputs") or []:
+            j = id_to_idx.get(src, -1)
+            edges.append((j, i, labels[j] if j >= 0 else "?", labels[i]))
+    return {"nodes": labels, "edges": tuple(edges)}
+
+
+def _topology_key(sig):
+    return (tuple(sig["nodes"]), tuple(sig["edges"]))
+
+
+def _workflow_signatures():
+    """Scaffold layouts in ge_lib/workflows/*.json as topology keys (so a shape can be matched to a recipe)."""
+    from ge_lib import scaffold
+    out = {}
+    for w in scaffold.workflows():
+        wf = scaffold.load_workflow(w["name"])
+        nodes = [{**n, "id": n["id"].replace("{patch_node}", "patch")} for n in wf["nodes"]]
+        for n in nodes:
+            n["inputs"] = [x.replace("{patch_node}", "patch") for x in n.get("inputs", [])]
+        out.setdefault(_topology_key(spec_topology_signature({"nodes": nodes})), []).append(w["name"])
+    return {k: ", ".join(v) for k, v in out.items()}
+
+
+def _ledger_summary(path):
+    spec, ok, seq = None, None, []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("event") == "run_started":
+                    spec = ev.get("spec")
+                elif ev.get("event") == "node_started":
+                    seq.append(ev.get("kind", "model"))
+                elif ev.get("event") == "run_done":
+                    ok = ev.get("ok")
+    except OSError:
+        pass
+    return {"spec": spec, "ok": ok, "sequence": seq}
+
+
+PROMOTE_MIN = 2   # a shape used by at least this many specs, with no recipe yet, is a recipe candidate
+
+
+def ge_stats(spec_roots=None, runs_dir=None, limit=20):
+    """Count graph shapes across spec files and ledgers. Shapes used twice or more without a recipe are
+    marked promote=true: that is the rule for adding a new scaffold layout (one-off shapes stay one-off)."""
+    spec_roots = spec_roots or [os.path.join(os.getcwd(), "graphs"), os.path.join(os.getcwd(), "examples"), os.getcwd()]
+    recipes = _workflow_signatures()
+    top, name_to_key = collections.OrderedDict(), {}
+    nspecs = 0
+    for path in _iter_spec_files(spec_roots):
+        spec = _load_spec_for_stats(path)
+        if not spec:
+            continue
+        nspecs += 1
+        sig = spec_topology_signature(spec)
+        key = _topology_key(sig)
+        name_to_key.setdefault(spec.get("name"), key)
+        item = top.setdefault(key, {"spec_count": 0, "run_count": 0, "ok_runs": 0,
+                                    "nodes": list(sig["nodes"]), "edges": [list(e) for e in sig["edges"]],
+                                    "workflow": recipes.get(key), "examples": []})
+        item["spec_count"] += 1
+        if len(item["examples"]) < 8:
+            item["examples"].append(_rel(path).replace(os.sep, "/"))
+    run_seq = collections.Counter()
+    root = runs_dir or os.path.join(GE_DIR, "runs")
+    for ledger in sorted(glob.glob(os.path.join(root, "*", "ledger.jsonl"))):
+        r = _ledger_summary(ledger)
+        run_seq[tuple(r["sequence"])] += 1
+        item = top.get(name_to_key.get(r["spec"]))
+        if item:
+            item["run_count"] += 1
+            item["ok_runs"] += 1 if r["ok"] else 0
+    for item in top.values():
+        item["promote"] = item["workflow"] is None and item["spec_count"] >= PROMOTE_MIN
+    topologies = sorted(top.values(), key=lambda x: (-x["spec_count"], -x["run_count"], x["nodes"]))[:limit]
+    return {"specs": nspecs, "topologies": topologies,
+            "run_sequences": [{"count": c, "shape": " -> ".join(s) or "(none)"} for s, c in run_seq.most_common(limit)]}
+
+
+def format_ge_stats(stats):
+    lines = [f"specs={stats['specs']}", "", "Spec topologies:"]
+    for t in stats["topologies"]:
+        tag = f"  [recipe: {t['workflow']}]" if t["workflow"] else ("  [promote: used twice, no recipe yet]" if t["promote"] else "")
+        lines.append(f"- {t['spec_count']} specs, {t['run_count']} runs ({t['ok_runs']} ok): "
+                     f"{' -> '.join(t['nodes']) or '(none)'}{tag}")
+        lines.append("  edges: " + (", ".join(f"{a}:{s}→{b}:{d}" for a, b, s, d in t["edges"]) or "-"))
+        lines.append("  examples: " + ", ".join(t["examples"]))
+    lines += ["", "Observed run node-kind sequences:"]
+    lines += [f"- {r['count']} runs: {r['shape']}" for r in stats["run_sequences"]] or ["- (none)"]
+    return "\n".join(lines)
+
+
+# ---------------- progress ----------------
+MARK = {"ok": "[v]", "fail": "[x]", "running": "[~]", "skipped": "[-]", "pending": "[ ]"}
+MARK_UNI = {"ok": "[✓]", "fail": "[✗]", "running": "[~]", "skipped": "[-]", "pending": "[ ]"}
+
+
+def _spec_node_order(spec_path):
+    """Full node order from the spec file (so nodes not started yet show as [ ]). None if unreadable."""
+    if not spec_path or not os.path.isfile(spec_path):
+        return None
+    try:
+        return topo(json.loads(_rt(spec_path, encoding="utf-8")))
+    except Exception:
+        return None
+
+
+def run_progress(run_dir):
+    """One ledger -> per-node state. No bodies."""
+    path = os.path.join(run_dir, "ledger.jsonl")
+    info = {"run": os.path.basename(run_dir), "spec": None, "spec_path": None, "ok": None,
+            "started_at": None, "ended_at": None, "nodes": [], "verdict": None, "tokens": {}, "spent_usd": 0.0}
+    seen, state, kinds, attempts, nstart = [], {}, {}, {}, {}
+    calls, fails, models, errs, secs = {}, {}, {}, {}, {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                e, nid = ev.get("event"), ev.get("node")
+                if e == "run_started":
+                    info.update(spec=ev.get("spec"), spec_path=ev.get("spec_path"), started_at=ev.get("ts"))
+                elif e in ("node_started", "node_skipped"):
+                    if nid not in seen:
+                        seen.append(nid)
+                    state[nid] = "running" if e == "node_started" else "skipped"
+                    kinds[nid] = ev.get("kind", "model")
+                    nstart[nid] = ev.get("ts")
+                elif e == "call":
+                    attempts[nid] = max(attempts.get(nid, 0), ev.get("attempt") or 1)
+                    calls[nid] = calls.get(nid, 0) + 1
+                    if ev.get("model"):
+                        models[nid] = ev["model"]
+                    if ev.get("duration_s"):
+                        secs[nid] = secs.get(nid, 0.0) + float(ev["duration_s"])
+                    for key in ("input_tokens", "output_tokens", "cache_read", "cache_write"):
+                        if ev.get(key):
+                            info["tokens"][key] = info["tokens"].get(key, 0) + int(ev[key])
+                    if ev.get("spent_usd"):
+                        info["spent_usd"] = round(float(ev["spent_usd"]), 4)
+                    if not ev.get("ok"):
+                        fails[nid] = fails.get(nid, 0) + 1
+                        why = ev.get("errors") or ([ev["error"]] if ev.get("error") else [])
+                        if why:
+                            errs[nid] = "; ".join(str(x) for x in why)[:200]
+                elif e == "node_done":
+                    state[nid] = "ok" if ev.get("ok") else "fail"
+                    if ev.get("verdict"):
+                        info["verdict"] = ev["verdict"]
+                elif e == "run_done":
+                    info["ok"] = ev.get("ok")
+                    info["ended_at"] = ev.get("ts")
+    except OSError:
+        return info
+    order = _spec_node_order(info["spec_path"])
+    order = (list(order) + [n for n in seen if n not in order]) if order else seen
+    info["nodes"] = [{"id": n, "kind": kinds.get(n), "state": state.get(n, "pending"),
+                      "attempts": attempts.get(n, 0), "started": nstart.get(n),
+                      "calls": calls.get(n, 0), "fails": fails.get(n, 0),
+                      "model": models.get(n), "last_error": errs.get(n),
+                      "secs": round(secs.get(n, 0.0), 1)} for n in order]
+    info["calls_total"] = sum(calls.values())
+    info["fails_total"] = sum(fails.values())
+    return info
+
+
+def progress(limit=8, runs_dir=None):
+    root = runs_dir or os.path.join(GE_DIR, "runs")
+    dirs = sorted((d for d in glob.glob(os.path.join(root, "*")) if os.path.isfile(os.path.join(d, "ledger.jsonl"))),
+                  key=lambda d: os.path.getmtime(os.path.join(d, "ledger.jsonl")), reverse=True)[:limit]
+    return [run_progress(d) for d in dirs]
+
+
+def _elapsed_s(ts):
+    """노드가 도는 중일 때 경과초. 화면이 살아 있다는 신호이기도 하다."""
+    if not ts:
+        return ""
+    try:
+        started = datetime.datetime.fromisoformat(str(ts)).timestamp()
+    except ValueError:
+        return ""
+    sec = int(max(0, time.time() - started))
+    return f"{sec}s" if sec < 90 else f"{sec // 60}m{sec % 60:02d}s"
+
+
+def format_progress(runs, unicode_marks=True):
+    m = MARK_UNI if unicode_marks else MARK
+    x = "✗" if unicode_marks else "x"
+    lines = []
+    for r in runs:
+        if r["ok"] is True:
+            head = m["ok"]
+        elif r["ok"] is False:
+            head = m["fail"]
+        elif any(n["state"] == "running" for n in r["nodes"]):
+            head = m["running"]
+        else:
+            head = m["pending"]
+        v = r.get("verdict") or {}
+        tail = f"  {v['pass']} pass / {v['fail']} fail" if v else ""
+        lines.append(f"{head} {r['run']}   ({r['spec']}){tail}")
+        chain = "   ".join(f"{m[n['state']]} {n['id']}" +
+                           (f"*{n['attempts']}" if n["attempts"] > 1 else "") +
+                           (f"{x}{n['fails']}" if n.get("fails") else "") +
+                           (f" {_elapsed_s(n.get('started'))}" if n["state"] == "running" else "")
+                           for n in r["nodes"])
+        if chain:
+            lines.append(f"    {chain}")
+        # Failed calls always show their reason. A "running" node can already be dead and retrying.
+        for n in r["nodes"]:
+            if n.get("fails"):
+                who = f"{n['model']}, " if n.get("model") else ""
+                dur = f"{n['secs']:.0f}s" if n.get("secs") else ""
+                lines.append(f"      \u21b3 {n['id']} {x}{n['fails']}  {n.get('last_error') or '이유 미기록'}  ({who}{dur})")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ge", description="work-graph coordinator")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("plan"); p.add_argument("spec")
+    p = sub.add_parser("run"); p.add_argument("spec")
+    p.add_argument("--executor", default=os.environ.get("GE_EXECUTOR", "claude"), choices=list(EXECUTORS))
+    p.add_argument("--run-id"); p.add_argument("--model"); p.add_argument("--input", action="append", default=[])
+    p.add_argument("--max-cost", type=float, help="cumulative cost cap (USD); only executors that report cost")
+    p.add_argument("--no-baseline", action="store_true", help="skip the probe self-check on the original")
+    p.add_argument("--resume", metavar="RUN_ID", help="reuse model-node artifacts of this run (needs --from)")
+    p.add_argument("--from", dest="from_stage", choices=["guard", "verify"],
+                   help="guard: rerun from the probe / verify: keep the old probe result and rerun verify")
+    p = sub.add_parser("note"); p.add_argument("run_dir"); p.add_argument("text")
+    p = sub.add_parser("report"); p.add_argument("run_dir"); p.add_argument("--out", help="append the metrics line to this JSONL file")
+    p = sub.add_parser("ledger"); p.add_argument("--spec"); p.add_argument("--role"); p.add_argument("--since")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("lesson", help="one lesson line for a producing node (never for the checker)")
+    p.add_argument("spec"); p.add_argument("node"); p.add_argument("text"); p.add_argument("--run")
+    p = sub.add_parser("new", help="scaffold a spec (contract slot, separate verify, script apply, lessons)")
+    p.add_argument("name"); p.add_argument("--cwd", required=True); p.add_argument("--target", required=True)
+    p.add_argument("--workflow", default="patch", help="node layout (ge_lib/workflows/*.json); see `ge workflows`")
+    p.add_argument("--node", default="patch"); p.add_argument("--apply", default=None, help="apply script; default generates <spec>/apply.py")
+    p.add_argument("--root", default=".", help="folder that gets graphs/<name>.json (default: current directory)")
+    p.add_argument("--force", action="store_true")
+    sub.add_parser("workflows", help="list scaffold layouts")
+    p = sub.add_parser("contract-sha", help="compute contract.inputs sha256; --write updates the spec")
+    p.add_argument("spec"); p.add_argument("--write", action="store_true")
+    p = sub.add_parser("approve", help="approve an out-of-scope item (file:… / table:…) blocked by the acceptance gate")
+    p.add_argument("run_dir"); p.add_argument("item"); p.add_argument("--note")
+    p = sub.add_parser("trace", help="write a worker's raw output to a file")
+    p.add_argument("run_dir"); p.add_argument("--node"); p.add_argument("--attempt", type=int); p.add_argument("--out")
+    p = sub.add_parser("progress", help="node-by-node status of recent runs")
+    p.add_argument("--limit", type=int, default=8); p.add_argument("--json", action="store_true")
+    p.add_argument("--ascii", action="store_true")
+    p = sub.add_parser("fabric", help="find a prompt skeleton in the Fabric patterns (spec-writing aid)")
+    p.add_argument("query", nargs="?"); p.add_argument("--show"); p.add_argument("--limit", type=int, default=12)
+    p.add_argument("--check", action="store_true", help="compare names and body shas with upstream (no download)")
+    p.add_argument("--sync", action="store_true", help="download upstream once and build the local manifest")
+    p.add_argument("--dry", action="store_true", help="with --sync: download only, do not write")
+    p = sub.add_parser("stats", help="count node/edge shapes across specs and ledgers; marks recipe candidates")
+    p.add_argument("--topologies", action="store_true", help="(default output)")
+    p.add_argument("roots", nargs="*", help="folders with *.json specs (default: ./graphs ./examples .)")
+    p.add_argument("--json", action="store_true"); p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("check-model", help="check the structural invariants in formal/ with Alloy (needs java + Alloy jar)")
+    p.add_argument("--jar", help="Alloy 6 jar (default: $ALLOY_JAR)")
+    a = ap.parse_args(argv)
+    if a.cmd == "plan":
+        spec = load_spec(a.spec)
+        print(json.dumps({"name": spec["name"], "spec_sha": spec["_sha"], "order": topo(spec),
+                          "kinds": {n["id"]: n.get("kind", "model") for n in spec["nodes"]},
+                          "warnings": path_length_warnings(spec, datetime.datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + spec["name"])},
+                         ensure_ascii=False, indent=1))
+    elif a.cmd == "run":
+        spec = load_spec(a.spec)
+        run_id = a.run_id or datetime.datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + spec["name"]
+        kv = dict(x.split("=", 1) for x in a.input)
+        for w in path_length_warnings(spec, run_id):
+            print("경고: " + w, file=sys.stderr)
+        if bool(a.resume) != bool(a.from_stage):
+            print("--resume 과 --from 은 함께 쓴다", file=sys.stderr); sys.exit(2)
+        if a.resume and not os.path.isdir(os.path.join(GE_DIR, "runs", a.resume, "artifacts")):
+            print(f"resume 대상 런이 없다: {a.resume}", file=sys.stderr); sys.exit(2)
+        r = Run(spec, run_id, a.executor, a.model, kv, max_cost=a.max_cost, baseline=not a.no_baseline,
+                resume=a.resume, resume_from=a.from_stage)
+        ok = r.run()
+        out = {"run_dir": _rel(os.path.join(GE_DIR, "runs", run_id)), "ok": ok}
+        if not ok and r.cause:
+            out["cause"] = r.cause
+        print(json.dumps(out, ensure_ascii=False))
+        if not ok and r.cause:
+            print("실패 원인: " + r.cause)          # last line = what a completion notice shows
+        sys.exit(0 if ok else 1)
+    elif a.cmd == "note":
+        with open(os.path.join(a.run_dir, "ledger.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "note", "ts": now(), "text": a.text}, ensure_ascii=False) + "\n")
+        print("기록됨")
+    elif a.cmd == "ledger":
+        t = roles_table(ledger_rows(), spec=a.spec, role=a.role, since=a.since)
+        print(json.dumps(t, ensure_ascii=False, indent=1) if a.json else format_roles(t))
+    elif a.cmd == "lesson":
+        print(json.dumps(add_lesson(a.spec, a.node, a.text, a.run), ensure_ascii=False, indent=1))
+    elif a.cmd == "new":
+        from ge_lib import scaffold
+        print(json.dumps(scaffold.new_spec(a.name, a.cwd, a.target, a.node, a.apply, a.force,
+                                          workflow=a.workflow, root=a.root), ensure_ascii=False, indent=1))
+    elif a.cmd == "workflows":
+        from ge_lib import scaffold
+        print(json.dumps(scaffold.workflows(), ensure_ascii=False, indent=1))
+    elif a.cmd == "contract-sha":
+        r = contract_sha(a.spec, a.write)
+        print(json.dumps(r, ensure_ascii=False, indent=1))
+        sys.exit(0 if r["ok"] else 1)
+    elif a.cmd == "approve":
+        print(json.dumps(guard.approve(a.run_dir, a.item, note=a.note), ensure_ascii=False, indent=1))
+    elif a.cmd == "trace":
+        r = trace(a.run_dir, a.node, a.attempt, a.out)
+        print(json.dumps(r, ensure_ascii=False, indent=1))
+        sys.exit(0 if r.get("ok") else 1)
+    elif a.cmd == "progress":
+        rs = progress(limit=a.limit)
+        print(json.dumps(rs, ensure_ascii=False, indent=1) if a.json else format_progress(rs, unicode_marks=not a.ascii))
+    elif a.cmd == "fabric":
+        if a.check:
+            r = fabric.check()
+        elif a.sync:
+            r = fabric.sync(dry=a.dry)
+        elif a.show:
+            r = fabric.show(a.show, os.path.join(GE_DIR, "fabric"))
+        else:
+            r = fabric.search(a.query, a.limit)
+        print(json.dumps(r, ensure_ascii=False, indent=1))
+        sys.exit(0 if r.get("ok") else 1)
+    elif a.cmd == "stats":
+        r = ge_stats(spec_roots=[os.path.abspath(x) for x in a.roots] or None, limit=a.limit)
+        print(json.dumps(r, ensure_ascii=False, indent=1) if a.json else format_ge_stats(r))
+    elif a.cmd == "check-model":
+        from ge_lib import alloy_check
+        sys.exit(alloy_check.main(jar=a.jar))
+    elif a.cmd == "report":
+        m = metrics(a.run_dir)
+        print(json.dumps(m, ensure_ascii=False, indent=1))
+        if a.out:
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+            with open(a.out, "a", encoding="utf-8") as f:
+                f.write(json.dumps({**m, "kind": "ge-run"}, ensure_ascii=False) + "\n")
+
+
+if __name__ == "__main__":
+    main()
