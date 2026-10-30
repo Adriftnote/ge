@@ -68,7 +68,7 @@ nodes with a separate checker and a ledger made those cases visible.
 
 ## Quick start
 
-Python 3.9+ and the standard library only. The examples need no AI:
+Python 3.10+ and the standard library only (CI runs 3.10 and 3.12; 3.9.6 also passed locally). The examples need no AI:
 
 ```
 git clone https://github.com/Adriftnote/ge && cd ge

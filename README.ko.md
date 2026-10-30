@@ -64,7 +64,7 @@ patch (모델 A) ──► probe (임시 사본에서 테스트) ──► verif
 
 ## 빠른 시작
 
-Python 3.9+ 표준 라이브러리만 쓴다. 예시는 AI 없이 돈다.
+Python 3.10+ 표준 라이브러리만 쓴다 (CI 는 3.10·3.12, 로컬에서 3.9.6 도 통과). 예시는 AI 없이 돈다.
 
 ```
 git clone https://github.com/Adriftnote/ge && cd ge
